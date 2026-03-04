@@ -73,11 +73,14 @@ class _UnifiedWorkerPool:
             return None
 
         req_id = request.req_id or make_req_id()
+        cancel_event = threading.Event()
         task = QueuedTask(
             request=request,
             created_ms=_now_ms(),
             req_id=req_id,
             done_event=threading.Event(),
+            cancelled=False,
+            cancel_event=cancel_event,
         )
 
         session = adapter.load_session(Path(request.work_dir))
@@ -186,6 +189,13 @@ class UnifiedAskDaemon:
         wait_timeout = None if float(request.timeout_s) < 0.0 else (float(request.timeout_s) + 5.0)
         task.done_event.wait(timeout=wait_timeout)
         result = task.result
+
+        # If timeout occurred and task is still running, mark it as cancelled
+        if not result and not task.done_event.is_set():
+            _write_log(f"[WARN] Task timeout, marking as cancelled: provider={provider} req_id={task.req_id}")
+            task.cancelled = True
+            if task.cancel_event:
+                task.cancel_event.set()
 
         if not result:
             return {

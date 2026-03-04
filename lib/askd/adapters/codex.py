@@ -12,7 +12,7 @@ from typing import Any, Optional
 
 from askd.adapters.base import BaseProviderAdapter, ProviderRequest, ProviderResult, QueuedTask
 from askd_runtime import log_path, write_log
-from ccb_protocol import REQ_ID_PREFIX, is_done_text, strip_done_text, wrap_codex_prompt
+from ccb_protocol import REQ_ID_PREFIX, is_done_text, strip_done_text, extract_reply_for_req, wrap_codex_prompt
 from caskd_session import CodexProjectSession, compute_session_key, load_project_session
 from codex_comm import CodexLogReader
 from completion_hook import notify_completion
@@ -118,6 +118,11 @@ class CodexAdapter(BaseProviderAdapter):
         done_ms: Optional[int] = None
         fallback_scan = False
 
+        # Idle timeout detection for degraded completion
+        idle_timeout = float(os.environ.get("CCB_CASKD_IDLE_TIMEOUT", "8.0"))
+        _last_reply_snapshot = ""
+        _last_reply_changed_at = time.time()
+
         anchor_grace_deadline = min(deadline, time.time() + 1.5) if deadline else (time.time() + 1.5)
         anchor_collect_grace = min(deadline, time.time() + 2.0) if deadline else (time.time() + 2.0)
         rebounded = False
@@ -127,6 +132,11 @@ class CodexAdapter(BaseProviderAdapter):
         pane_check_interval = float(os.environ.get("CCB_CASKD_PANE_CHECK_INTERVAL", default_interval))
 
         while True:
+            # Check for cancellation
+            if task.cancel_event and task.cancel_event.is_set():
+                _write_log(f"[INFO] Task cancelled during wait loop: req_id={task.req_id}")
+                break
+
             if deadline is not None:
                 remaining = deadline - time.time()
                 if remaining <= 0:
@@ -163,14 +173,28 @@ class CodexAdapter(BaseProviderAdapter):
                 last_pane_check = time.time()
 
             event, state = reader.wait_for_event(state, wait_step)
+
+            # Active session detection: check if reader switched to a newer session
+            current_log = reader.current_log_path()
+            if current_log and current_log != state.get("log_path"):
+                _write_log(f"[INFO] Active session switch detected: {current_log}, req_id={task.req_id}")
+                # Update state to follow new session
+                state = _tail_state_for_log(current_log, tail_bytes=tail_bytes)
+                fallback_scan = True
+                # Don't set rebounded=True to allow further rebinds if needed
+
+            # Force rebind at grace deadline even if we have stale events
+            if (not rebounded) and (not anchor_seen) and time.time() >= anchor_grace_deadline and codex_session_id:
+                _write_log(f"[WARN] Anchor not seen by grace deadline, forcing rebind: req_id={task.req_id}")
+                codex_session_id = None
+                reader = CodexLogReader(log_path=preferred_log, session_id_filter=None, work_dir=Path(session.work_dir))
+                log_hint = reader.current_log_path()
+                state = _tail_state_for_log(log_hint, tail_bytes=tail_bytes)
+                fallback_scan = True
+                rebounded = True
+                continue
+
             if event is None:
-                if (not rebounded) and (not anchor_seen) and time.time() >= anchor_grace_deadline and codex_session_id:
-                    codex_session_id = None
-                    reader = CodexLogReader(log_path=preferred_log, session_id_filter=None, work_dir=Path(session.work_dir))
-                    log_hint = reader.current_log_path()
-                    state = _tail_state_for_log(log_hint, tail_bytes=tail_bytes)
-                    fallback_scan = True
-                    rebounded = True
                 continue
 
             role, text = event
@@ -184,6 +208,8 @@ class CodexAdapter(BaseProviderAdapter):
             if role != "assistant":
                 continue
 
+            # Use grace window: allow collecting after grace period even without anchor
+            # (but prefer waiting for anchor during grace period)
             if (not anchor_seen) and time.time() < anchor_collect_grace:
                 continue
 
@@ -194,8 +220,40 @@ class CodexAdapter(BaseProviderAdapter):
                 done_ms = _now_ms() - started_ms
                 break
 
+            # Idle-timeout: detect when Codex finished but forgot CCB_DONE
+            if combined != _last_reply_snapshot:
+                _last_reply_snapshot = combined
+                _last_reply_changed_at = time.time()
+            elif combined and (time.time() - _last_reply_changed_at >= idle_timeout):
+                _write_log(
+                    f"[WARN] Codex reply idle for {idle_timeout}s without CCB_DONE, "
+                    f"accepting as complete req_id={task.req_id}"
+                )
+                done_seen = True
+                done_ms = _now_ms() - started_ms
+                break
+
         combined = "\n".join(chunks)
-        reply = strip_done_text(combined, task.req_id)
+        reply = extract_reply_for_req(combined, task.req_id)
+
+        # Fallback: if timeout but we have a reply with any CCB_DONE marker,
+        # accept it even if req_id doesn't match (degraded completion detection)
+        degraded_completion = False
+        if not done_seen and combined and "CCB_DONE:" in combined:
+            _write_log(f"[WARN] Found CCB_DONE but req_id mismatch for req_id={task.req_id}")
+            # Extract the mismatched req_id for logging
+            for line in combined.splitlines():
+                if "CCB_DONE:" in line:
+                    _write_log(f"[WARN] Expected: CCB_DONE: {task.req_id}, Found: {line.strip()}")
+                    break
+            # Only accept if we have non-empty reply
+            if reply.strip():
+                done_seen = True
+                degraded_completion = True
+                done_ms = _now_ms() - started_ms
+            else:
+                _write_log(f"[WARN] Degraded completion rejected: empty reply for req_id={task.req_id}")
+
         codex_log_path = None
         try:
             lp = state.get("log_path")
@@ -220,6 +278,11 @@ class CodexAdapter(BaseProviderAdapter):
             f"[INFO] done provider=codex req_id={task.req_id} exit={result.exit_code} "
             f"anchor={result.anchor_seen} done={result.done_seen}"
         )
+
+        # Skip completion hook for cancelled tasks
+        if task.cancelled:
+            _write_log(f"[INFO] Task cancelled, skipping completion hook: req_id={task.req_id}")
+            return result
 
         # Log caller info before notify_completion
         _write_log(f"[INFO] notify_completion caller={req.caller} done_seen={done_seen}")

@@ -86,6 +86,10 @@ class AskDaemonServer:
         self.managed = env_managed if managed is None else bool(managed)
         if self.parent_pid:
             self.managed = True
+        self._heartbeat_thread = None
+        self._heartbeat_stop_event = None
+        self._started_at = None
+        self._state_write_lock = threading.Lock()  # Serialize persistent state writes
 
     def serve_forever(self) -> int:
         run_dir().mkdir(parents=True, exist_ok=True)
@@ -236,14 +240,32 @@ class AskDaemonServer:
 
                 actual_host, actual_port = httpd.server_address
                 self._write_state(str(actual_host), int(actual_port))
+                self._started_at = time.strftime("%Y-%m-%d %H:%M:%S")
+                self._write_persistent_state("running")
+                self._start_heartbeat_thread()
                 write_log(
                     log_path(self.spec.log_file_name),
                     f"[INFO] {self.spec.daemon_key} started pid={os.getpid()} addr={actual_host}:{actual_port}",
                 )
+
+                crashed = False
+                crash_reason = ""
                 try:
                     httpd.serve_forever(poll_interval=0.2)
+                except Exception as e:
+                    # Unexpected crash during serve
+                    crashed = True
+                    crash_reason = f"Exception: {e}"
+                    write_log(log_path(self.spec.log_file_name), f"[ERROR] {self.spec.daemon_key} crashed: {e}")
+                    self._stop_heartbeat_thread()
+                    self._write_persistent_state("crashed", crash_reason)
+                    raise
                 finally:
                     write_log(log_path(self.spec.log_file_name), f"[INFO] {self.spec.daemon_key} stopped")
+                    self._stop_heartbeat_thread()
+                    # Only write stopped if not crashed
+                    if not crashed:
+                        self._write_persistent_state("stopped", "graceful shutdown")
                     if self.on_stop:
                         try:
                             self.on_stop()
@@ -277,3 +299,71 @@ class AskDaemonServer:
                     os.chmod(self.state_file, 0o600)
                 except Exception:
                     pass
+
+    def _write_persistent_state(self, status: str, exit_reason: str = "", exit_code: int = 0) -> None:
+        """Write persistent state to askd.last.json for debugging and observability."""
+        with self._state_write_lock:  # Serialize writes
+            last_state_file = self.state_file.parent / f"{self.state_file.stem}.last.json"
+            payload = {
+                "status": status,  # running, stopping, stopped, crashed
+                "pid": os.getpid(),
+                "started_at": self._started_at,
+                "heartbeat_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "work_dir": self.work_dir,
+                "parent_pid": int(self.parent_pid or 0) or None,
+                "managed": bool(self.managed),
+            }
+            if status in ("stopped", "crashed"):
+                payload["stopped_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                if exit_reason:
+                    payload["exit_reason"] = exit_reason
+                if exit_code:
+                    payload["exit_code"] = exit_code
+            try:
+                last_state_file.parent.mkdir(parents=True, exist_ok=True)
+                safe_write_session(last_state_file, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+            except Exception:
+                pass
+
+    def _start_heartbeat_thread(self) -> None:
+        """Start heartbeat thread to periodically update state file."""
+        # Restart if thread exists but is dead
+        if self._heartbeat_thread is not None:
+            if not self._heartbeat_thread.is_alive():
+                self._heartbeat_thread = None
+                self._heartbeat_stop_event = None
+            else:
+                return  # Already running
+
+        self._heartbeat_stop_event = threading.Event()
+        self._heartbeat_thread = threading.Thread(
+            target=self._heartbeat_loop,
+            daemon=True,
+            name="askd-heartbeat"
+        )
+        self._heartbeat_thread.start()
+
+    def _heartbeat_loop(self) -> None:
+        """Periodically update heartbeat_at in state file."""
+        # Validate and clamp interval
+        try:
+            interval = float(os.environ.get("CCB_HEARTBEAT_INTERVAL_S", "2"))
+            interval = max(0.5, min(interval, 60.0))  # Clamp to 0.5-60 seconds
+        except (ValueError, TypeError):
+            interval = 2.0
+
+        while not self._heartbeat_stop_event.wait(interval):
+            try:
+                self._write_persistent_state("running")
+            except Exception:
+                pass
+
+    def _stop_heartbeat_thread(self) -> None:
+        """Stop heartbeat thread."""
+        if self._heartbeat_stop_event:
+            self._heartbeat_stop_event.set()
+        if self._heartbeat_thread:
+            self._heartbeat_thread.join(timeout=0.5)
+            # Only clear if thread actually stopped
+            if not self._heartbeat_thread.is_alive():
+                self._heartbeat_thread = None

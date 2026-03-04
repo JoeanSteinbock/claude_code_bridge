@@ -129,6 +129,11 @@ class DroidAdapter(BaseProviderAdapter):
         last_pane_check = time.time()
 
         while True:
+            # Check for cancellation
+            if task.cancel_event and task.cancel_event.is_set():
+                _write_log(f"[INFO] Task cancelled during wait loop: req_id={task.req_id}")
+                break
+
             if deadline is not None:
                 remaining = deadline - time.time()
                 if remaining <= 0:
@@ -190,18 +195,22 @@ class DroidAdapter(BaseProviderAdapter):
         combined = "\n".join(chunks)
         final_reply = extract_reply_for_req(combined, task.req_id)
 
-        notify_completion(
-            provider="droid",
-            output_file=req.output_path,
-            reply=final_reply,
-            req_id=task.req_id,
-            done_seen=done_seen,
-            caller=req.caller,
-            email_req_id=req.email_req_id,
-            email_msg_id=req.email_msg_id,
-            email_from=req.email_from,
-            work_dir=req.work_dir,
-        )
+        # Skip completion hook for cancelled tasks
+        if not task.cancelled:
+            notify_completion(
+                provider="droid",
+                output_file=req.output_path,
+                reply=final_reply,
+                req_id=task.req_id,
+                done_seen=done_seen,
+                caller=req.caller,
+                email_req_id=req.email_req_id,
+                email_msg_id=req.email_msg_id,
+                email_from=req.email_from,
+                work_dir=req.work_dir,
+            )
+        else:
+            _write_log(f"[INFO] Task cancelled, skipping completion hook: req_id={task.req_id}")
 
         result = ProviderResult(
             exit_code=0 if done_seen else 2,

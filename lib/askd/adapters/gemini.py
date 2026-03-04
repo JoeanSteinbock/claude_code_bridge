@@ -177,6 +177,11 @@ class GeminiAdapter(BaseProviderAdapter):
         _last_reply_changed_at = time.time()
 
         while True:
+            # Check for cancellation
+            if task.cancel_event and task.cancel_event.is_set():
+                _write_log(f"[INFO] Task cancelled during wait loop: req_id={task.req_id}")
+                break
+
             if deadline is not None:
                 remaining = deadline - time.time()
                 if remaining <= 0:
@@ -262,22 +267,29 @@ class GeminiAdapter(BaseProviderAdapter):
                 if "CCB_DONE:" in line:
                     _write_log(f"[WARN] Expected: CCB_DONE: {task.req_id}, Found: {line.strip()}")
                     break
-            # Accept as completed in degraded mode
-            done_seen = True
-            done_ms = _now_ms() - started_ms
+            # Only accept if we have non-empty reply
+            if final_reply.strip():
+                done_seen = True
+                done_ms = _now_ms() - started_ms
+            else:
+                _write_log(f"[WARN] Degraded completion rejected: empty reply for req_id={task.req_id}")
 
-        notify_completion(
-            provider="gemini",
-            output_file=req.output_path,
-            reply=final_reply,
-            req_id=task.req_id,
-            done_seen=done_seen,
-            caller=req.caller,
-            email_req_id=req.email_req_id,
-            email_msg_id=req.email_msg_id,
-            email_from=req.email_from,
-            work_dir=req.work_dir,
-        )
+        # Skip completion hook for cancelled tasks
+        if not task.cancelled:
+            notify_completion(
+                provider="gemini",
+                output_file=req.output_path,
+                reply=final_reply,
+                req_id=task.req_id,
+                done_seen=done_seen,
+                caller=req.caller,
+                email_req_id=req.email_req_id,
+                email_msg_id=req.email_msg_id,
+                email_from=req.email_from,
+                work_dir=req.work_dir,
+            )
+        else:
+            _write_log(f"[INFO] Task cancelled, skipping completion hook: req_id={task.req_id}")
 
         result = ProviderResult(
             exit_code=0 if done_seen else 2,

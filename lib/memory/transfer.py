@@ -299,14 +299,13 @@ class ContextTransfer:
         session_id: Optional[str] = None,
     ) -> TransferContext:
         session_file, data = self._load_session_data("codex")
+        # Only use current active session, not old_* fallback to prevent "amnesia"
         log_path = session_path or (
             data.get("codex_session_path")
-            or data.get("old_codex_session_path")
             or data.get("session_path")
         )
         session_id = session_id or (
             data.get("codex_session_id")
-            or data.get("old_codex_session_id")
             or data.get("session_id")
             or ""
         )
@@ -353,13 +352,13 @@ class ContextTransfer:
         session_id: Optional[str] = None,
     ) -> TransferContext:
         session_file, data = self._load_session_data("gemini")
+        # Only use current active session, not old_* fallback to prevent "amnesia"
         session_id = session_id or (
             data.get("gemini_session_id")
-            or data.get("old_gemini_session_id")
             or data.get("session_id")
             or ""
         )
-        preferred_path = session_path or (data.get("gemini_session_path") or data.get("old_gemini_session_path"))
+        preferred_path = session_path or data.get("gemini_session_path")
         preferred_path_obj: Optional[Path] = None
         if preferred_path:
             try:
@@ -401,13 +400,13 @@ class ContextTransfer:
         session_id: Optional[str] = None,
     ) -> TransferContext:
         session_file, data = self._load_session_data("droid")
+        # Only use current active session, not old_* fallback to prevent "amnesia"
         session_id = session_id or (
             data.get("droid_session_id")
-            or data.get("old_droid_session_id")
             or data.get("session_id")
             or ""
         )
-        preferred_path = session_path or (data.get("droid_session_path") or data.get("old_droid_session_path"))
+        preferred_path = session_path or data.get("droid_session_path")
         preferred_path_obj: Optional[Path] = None
         if preferred_path:
             try:
@@ -451,14 +450,14 @@ class ContextTransfer:
         project_id: Optional[str] = None,
     ) -> TransferContext:
         session_file, data = self._load_session_data("opencode")
+        # Only use current active session, not old_* fallback to prevent "amnesia"
         session_id = session_id or (
             data.get("opencode_session_id")
-            or data.get("old_opencode_session_id")
             or data.get("opencode_storage_session_id")
             or data.get("session_id")
             or ""
         )
-        project_id = project_id or (data.get("opencode_project_id") or data.get("old_opencode_project_id") or "")
+        project_id = project_id or data.get("opencode_project_id") or ""
 
         from opencode_comm import OpenCodeLogReader
 

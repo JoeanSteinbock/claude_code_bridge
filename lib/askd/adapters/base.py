@@ -61,6 +61,8 @@ class QueuedTask:
     req_id: str
     done_event: threading.Event
     result: Optional[ProviderResult] = None
+    cancelled: bool = False  # Cancellation flag for timeout/expiry
+    cancel_event: Optional[threading.Event] = None  # Event for cooperative cancellation
 
 
 class BaseProviderAdapter(ABC):

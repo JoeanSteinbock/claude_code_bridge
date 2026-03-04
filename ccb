@@ -21,6 +21,7 @@ import re
 import shutil
 import posixpath
 import shlex
+import threading
 from pathlib import Path
 
 script_dir = Path(__file__).resolve().parent
@@ -51,9 +52,9 @@ backend_env = get_backend_env()
 if backend_env and not os.environ.get("CCB_BACKEND_ENV"):
     os.environ["CCB_BACKEND_ENV"] = backend_env
 
-VERSION = "5.2.6"
-GIT_COMMIT = "v5.2.6"
-GIT_DATE = "2026-02-24"
+VERSION = "5.2.4"
+GIT_COMMIT = "c539e79"
+GIT_DATE = "2026-02-25"
 
 _WIN_DRIVE_RE = re.compile(r"^[A-Za-z]:([/\\\\]|$)")
 _MNT_DRIVE_RE = re.compile(r"^/mnt/([A-Za-z])/(.*)$")
@@ -384,7 +385,14 @@ def _is_pid_alive(pid: int) -> bool:
     try:
         os.kill(int(pid), 0)
         return True
+    except ProcessLookupError:
+        # Process doesn't exist
+        return False
+    except PermissionError:
+        # Process exists but no permission to check
+        return True
     except Exception:
+        # Other errors - assume dead for safety
         return False
 
 
@@ -570,6 +578,10 @@ class AILauncher:
         self.runtime_dir.mkdir(parents=True, exist_ok=True)
         self._cleaned = False
         self._askd_checked = False
+        self._watchdog_thread = None
+        self._watchdog_stop_event = None
+        self._daemon_proc = None  # Track daemon Popen object for reaping
+        self._daemon_proc_lock = threading.Lock()  # Protect daemon_proc access
         self.terminal_type = self._detect_terminal_type()
         self.tmux_sessions = {}
         self.tmux_panes = {}
@@ -737,6 +749,24 @@ class AILauncher:
     def _maybe_start_caskd(self) -> None:
         self._maybe_start_provider_daemon("codex")
 
+    def _maybe_start_unified_askd(self) -> None:
+        """Start unified askd daemon (provider-agnostic)."""
+        # Try to start for any enabled provider that uses askd (including claude)
+        for provider in ["codex", "gemini", "opencode", "droid", "claude"]:
+            if provider in [p.lower() for p in self.providers]:
+                # Try to start and check if successful
+                self._maybe_start_provider_daemon(provider)
+                # Verify daemon actually started by pinging
+                try:
+                    from askd_runtime import state_file_path
+                    from askd.daemon import ping_daemon
+                    state_file = state_file_path("askd.json")
+                    if ping_daemon(timeout_s=0.5, state_file=state_file):
+                        return  # Successfully started
+                except Exception:
+                    pass
+                # If not successful, continue to next provider
+
     def _maybe_start_provider_daemon(self, provider: str) -> None:
         def _bool_from_env(name: str):
             raw = os.environ.get(name)
@@ -804,12 +834,45 @@ class AILauncher:
             if spec.daemon_bin_name == "askd" and not self._askd_checked:
                 self._askd_checked = True
                 if not _owned_by_ccb(st):
-                    print("⚠️ askd already running but not managed by this CCB; restarting to bind lifecycle.")
-                    if callable(shutdown_daemon_fn):
+                    # Check if forced rebind is enabled (case-insensitive)
+                    force_rebind = _env_bool("CCB_FORCE_REBIND", False)
+
+                    # Check if foreign parent is still alive before forcing rebind
+                    # Safely normalize parent_pid to int (handle None, non-int, etc.)
+                    try:
+                        foreign_parent_pid = int((st or {}).get("parent_pid") or 0)
+                    except Exception:
+                        foreign_parent_pid = 0
+
+                    foreign_parent_alive = False
+                    if not force_rebind and foreign_parent_pid > 0:
                         try:
-                            shutdown_daemon_fn(timeout_s=1.0, state_file=state_file)
+                            foreign_parent_alive = _is_pid_alive(foreign_parent_pid)
                         except Exception:
-                            pass
+                            foreign_parent_alive = False
+
+                    if force_rebind or not foreign_parent_alive:
+                        # Safe to rebind: either forced or foreign parent is dead/stale
+                        if force_rebind:
+                            print(f"⚠️ CCB_FORCE_REBIND=1 set, forcing askd rebind despite live parent (PID {foreign_parent_pid})...")
+                        else:
+                            print(f"⚠️ askd owned by dead parent (PID {foreign_parent_pid}), restarting to bind lifecycle...")
+                        if callable(shutdown_daemon_fn):
+                            try:
+                                shutdown_daemon_fn(timeout_s=1.0, state_file=state_file)
+                            except Exception:
+                                pass
+                    else:
+                        # Foreign parent is still alive, don't force rebind
+                        print(f"⚠️ askd owned by live parent (PID {foreign_parent_pid}), skipping rebind to avoid disruption")
+                        print(f"   Set CCB_FORCE_REBIND=1 to override this safety check")
+                        host = st.get("host") if isinstance(st, dict) else None
+                        port = st.get("port") if isinstance(st, dict) else None
+                        if host and port:
+                            print(f"✅ {spec.daemon_bin_name} already running at {host}:{port}")
+                        else:
+                            print(f"✅ {spec.daemon_bin_name} already running")
+                        return
                     deadline = time.time() + 2.0
                     while time.time() < deadline:
                         if not ping_daemon(timeout_s=0.2, state_file=state_file):
@@ -860,7 +923,11 @@ class AILauncher:
         try:
             env = os.environ.copy()
             env["CCB_PARENT_PID"] = str(os.getpid())
-            subprocess.Popen([sys.executable, str(daemon_script)], env=env, **kwargs)
+            proc = subprocess.Popen([sys.executable, str(daemon_script)], env=env, **kwargs)
+            # Track daemon process for reaping (thread-safe)
+            if spec.daemon_bin_name == "askd":
+                with self._daemon_proc_lock:
+                    self._daemon_proc = proc
         except Exception as exc:
             print(f"⚠️ Failed to start {spec.daemon_bin_name}: {exc}")
             return
@@ -878,6 +945,144 @@ class AILauncher:
                 return
             time.sleep(0.1)
         print(f"⚠️ {spec.daemon_bin_name} start requested, but daemon not reachable yet")
+
+    def _start_daemon_watchdog(self) -> None:
+        """Start watchdog thread to monitor askd daemon health."""
+        import threading
+
+        # Restart if thread exists but is dead
+        if self._watchdog_thread is not None:
+            if not self._watchdog_thread.is_alive():
+                self._watchdog_thread = None
+                self._watchdog_stop_event = None
+            else:
+                return  # Already running
+
+        self._watchdog_stop_event = threading.Event()
+        self._watchdog_thread = threading.Thread(
+            target=self._daemon_watchdog_loop,
+            daemon=True,
+            name="askd-watchdog"
+        )
+        self._watchdog_thread.start()
+
+    def _daemon_watchdog_loop(self) -> None:
+        """Watchdog loop to monitor and restart askd daemon if needed."""
+        from askd_runtime import state_file_path
+        from askd.daemon import ping_daemon, read_state
+
+        # Validate and clamp check interval
+        try:
+            check_interval = float(os.environ.get("CCB_WATCHDOG_INTERVAL_S", "10"))
+            check_interval = max(1.0, min(check_interval, 300.0))  # Clamp to 1-300 seconds
+        except (ValueError, TypeError):
+            check_interval = 10.0
+
+        consecutive_failures = 0
+        max_failures = 3
+        ownership_mismatch_count = 0
+        max_ownership_mismatches = 3
+
+        while not self._watchdog_stop_event.wait(check_interval):
+            try:
+                # Reap zombie child processes
+                self._reap_zombie_children()
+
+                # Check if tracked daemon process has exited
+                with self._daemon_proc_lock:
+                    if self._daemon_proc is not None:
+                        exit_code = self._daemon_proc.poll()
+                        if exit_code is not None:
+                            # Daemon process has exited
+                            print(f"⚠️ askd daemon process exited with code {exit_code}", file=sys.stderr)
+                            self._daemon_proc = None
+                            # Will be restarted by health check below
+
+                # Check askd daemon health
+                state_file = state_file_path("askd.json")
+                if not ping_daemon(timeout_s=0.5, state_file=state_file):
+                    consecutive_failures += 1
+                    if consecutive_failures >= max_failures:
+                        # Daemon is unhealthy, try to restart
+                        print(f"⚠️ askd daemon unhealthy (failed {consecutive_failures} checks), attempting restart...", file=sys.stderr)
+                        self._maybe_start_unified_askd()
+                        consecutive_failures = 0
+                else:
+                    # Daemon is healthy, verify ownership
+                    state = read_state(state_file=state_file)
+                    if isinstance(state, dict):
+                        parent_pid = int(state.get("parent_pid") or 0)
+                        managed = bool(state.get("managed"))
+                        if managed and parent_pid != self.ccb_pid:
+                            ownership_mismatch_count += 1
+                            print(f"⚠️ askd daemon ownership mismatch (parent_pid={parent_pid}, expected={self.ccb_pid}, count={ownership_mismatch_count})", file=sys.stderr)
+                            if ownership_mismatch_count >= max_ownership_mismatches:
+                                # Check if forced rebind is enabled (case-insensitive)
+                                force_rebind = _env_bool("CCB_FORCE_REBIND", False)
+
+                                # Check if foreign parent is still alive before forcing rebind
+                                foreign_parent_alive = False
+                                if not force_rebind:
+                                    # Use existing _is_pid_alive for consistent cross-platform check
+                                    try:
+                                        foreign_parent_alive = _is_pid_alive(parent_pid)
+                                    except Exception:
+                                        foreign_parent_alive = False
+
+                                if force_rebind or not foreign_parent_alive:
+                                    # Safe to rebind: either forced or foreign parent is dead/stale
+                                    if force_rebind:
+                                        print(f"⚠️ CCB_FORCE_REBIND=1 set, forcing rebind despite live parent (PID {parent_pid})...", file=sys.stderr)
+                                    else:
+                                        print(f"⚠️ Foreign parent (PID {parent_pid}) is dead, attempting to rebind daemon...", file=sys.stderr)
+                                    try:
+                                        from askd_rpc import shutdown_daemon
+                                        shutdown_daemon("ask", timeout_s=2.0, state_file=state_file)
+                                        time.sleep(1.0)  # Wait for shutdown
+                                    except Exception:
+                                        pass
+                                    self._maybe_start_unified_askd()
+                                    ownership_mismatch_count = 0
+                                else:
+                                    # Foreign parent is still alive, don't force rebind
+                                    print(f"⚠️ Foreign parent (PID {parent_pid}) is still alive, skipping forced rebind to avoid disruption", file=sys.stderr)
+                                    print(f"   Set CCB_FORCE_REBIND=1 to override this safety check", file=sys.stderr)
+                                    ownership_mismatch_count = 0  # Reset to avoid repeated warnings
+                        else:
+                            ownership_mismatch_count = 0  # Reset on correct ownership
+                    consecutive_failures = 0
+            except Exception as e:
+                # Silently continue on watchdog errors
+                pass
+
+    def _reap_zombie_children(self) -> None:
+        """Reap tracked daemon process if it has exited."""
+        # Only reap the tracked daemon process, not all children
+        with self._daemon_proc_lock:
+            if self._daemon_proc is not None:
+                try:
+                    exit_code = self._daemon_proc.poll()
+                    if exit_code is not None:
+                        # Process has exited, reap it by calling wait()
+                        try:
+                            self._daemon_proc.wait(timeout=0.1)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+    def _stop_daemon_watchdog(self) -> None:
+        """Stop watchdog thread."""
+        if self._watchdog_stop_event:
+            self._watchdog_stop_event.set()
+        if self._watchdog_thread:
+            self._watchdog_thread.join(timeout=1.0)
+            # Only clear if thread actually stopped
+            if not self._watchdog_thread.is_alive():
+                self._watchdog_thread = None
+            else:
+                # Thread still running, log warning
+                pass  # Silently continue, daemon thread will exit with process
 
     def _detect_terminal_type(self):
         # Forced by environment variable
@@ -1129,34 +1334,6 @@ class AILauncher:
 
     def _claude_session_file(self) -> Path:
         return self._project_session_file(".claude-session")
-
-    def _backfill_existing_claude_session_work_dir_fields(self) -> None:
-        """Backfill work_dir/work_dir_norm for an existing .claude-session on startup."""
-        path = self._claude_session_file()
-        if not path.exists():
-            return
-
-        try:
-            raw = path.read_text(encoding="utf-8-sig")
-            data = json.loads(raw)
-        except Exception:
-            return
-        if not isinstance(data, dict):
-            return
-
-        changed = False
-        if not isinstance(data.get("work_dir"), str) or not str(data.get("work_dir") or "").strip():
-            data["work_dir"] = str(self.project_root)
-            changed = True
-        if not isinstance(data.get("work_dir_norm"), str) or not str(data.get("work_dir_norm") or "").strip():
-            data["work_dir_norm"] = _normalize_path_for_match(str(self.project_root))
-            changed = True
-
-        if not changed:
-            return
-
-        payload = json.dumps(data, ensure_ascii=False, indent=2)
-        safe_write_session(path, payload)
 
     def _read_local_claude_session_id(self) -> str | None:
         data = self._read_json_file(self._claude_session_file())
@@ -2953,6 +3130,10 @@ class AILauncher:
         if self._cleaned:
             return
         self._cleaned = True
+
+        # Stop watchdog thread first
+        self._stop_daemon_watchdog()
+
         if not quiet:
             print(f"\n🧹 {t('cleaning_up')}")
 
@@ -3011,10 +3192,47 @@ class AILauncher:
                     except Exception:
                         pass
 
-        # Ensure unified askd daemon exits when CCB exits.
+        # Ensure unified askd daemon exits when CCB exits (with ownership safety).
         try:
             askd_state = state_file_path("askd.json")
-            shutdown_daemon("ask", 1.0, askd_state)
+
+            # Read askd state to check ownership
+            askd_st = {}
+            if askd_state and askd_state.exists():
+                try:
+                    with open(askd_state, "r", encoding="utf-8") as f:
+                        askd_st = json.load(f)
+                except Exception:
+                    pass
+
+            # Check if we own this daemon or if forced shutdown is enabled
+            force_rebind = _env_bool("CCB_FORCE_REBIND", False)
+            owned_by_us = False
+            try:
+                parent_pid = int((askd_st or {}).get("parent_pid") or 0)
+                owned_by_us = (parent_pid == self.ccb_pid)
+            except Exception:
+                pass
+
+            # Only shutdown if we own it, or force flag is set, or owner is dead
+            should_shutdown = False
+            if force_rebind:
+                should_shutdown = True
+            elif owned_by_us:
+                should_shutdown = True
+            else:
+                # Check if foreign owner is still alive
+                try:
+                    parent_pid = int((askd_st or {}).get("parent_pid") or 0)
+                    if parent_pid > 0:
+                        foreign_alive = _is_pid_alive(parent_pid)
+                        if not foreign_alive:
+                            should_shutdown = True  # Owner is dead, safe to cleanup
+                except Exception:
+                    pass
+
+            if should_shutdown:
+                shutdown_daemon("ask", 1.0, askd_state)
         except Exception:
             pass
 
@@ -3056,11 +3274,6 @@ class AILauncher:
 
         if not self._require_project_config_dir():
             return 2
-
-        try:
-            self._backfill_existing_claude_session_work_dir_fields()
-        except Exception:
-            pass
 
         if not self.providers:
             print("❌ No providers configured. Define providers in ccb.config or pass them on the command line.", file=sys.stderr)
@@ -3185,6 +3398,9 @@ class AILauncher:
         # Optional: start caskd after Codex session file exists (first startup convenience).
         if "codex" in self.providers and self.anchor_provider != "codex":
             self._maybe_start_caskd()
+
+        # Start watchdog thread to monitor daemon health (provider-agnostic)
+        self._start_daemon_watchdog()
 
         try:
             try:

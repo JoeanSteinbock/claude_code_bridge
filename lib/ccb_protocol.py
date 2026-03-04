@@ -99,6 +99,54 @@ def strip_done_text(text: str, req_id: str) -> str:
     return "\n".join(lines).rstrip()
 
 
+def extract_reply_for_req(text: str, req_id: str) -> str:
+    """
+    Extract the reply segment for req_id from a message.
+
+    When multiple replies are present (each ending with CCB_DONE: <req_id>),
+    extract only the segment between the previous done line and the done line
+    for our req_id. This prevents mixing old/stale content into the current reply.
+    """
+    lines = [ln.rstrip("\n") for ln in (text or "").splitlines()]
+    if not lines:
+        return ""
+
+    # Find all done-line indices and target req_id indices
+    target_re = re.compile(rf"^\s*CCB_DONE:\s*{re.escape(req_id)}\s*$", re.IGNORECASE)
+    done_idxs = [i for i, ln in enumerate(lines) if _ANY_CCB_DONE_LINE_RE.match(ln or "")]
+    target_idxs = [i for i in done_idxs if target_re.match(lines[i] or "")]
+
+    if not target_idxs:
+        # No CCB_DONE for our req_id found
+        # If there are other CCB_DONE markers, this is likely old content - return empty
+        # to avoid mixing old replies into current request
+        if done_idxs:
+            return ""  # Prevent returning old content
+        # No CCB_DONE markers at all - fallback to strip behavior
+        return strip_done_text(text, req_id)
+
+    # Find the last occurrence of our req_id's done line
+    target_i = target_idxs[-1]
+
+    # Find the previous done line (any req_id)
+    prev_done_i = -1
+    for i in reversed(done_idxs):
+        if i < target_i:
+            prev_done_i = i
+            break
+
+    # Extract segment between previous done and our done
+    segment = lines[prev_done_i + 1 : target_i]
+
+    # Trim leading/trailing blank lines
+    while segment and segment[0].strip() == "":
+        segment = segment[1:]
+    while segment and segment[-1].strip() == "":
+        segment = segment[:-1]
+
+    return "\n".join(segment).rstrip()
+
+
 @dataclass(frozen=True)
 class CaskdRequest:
     client_id: str

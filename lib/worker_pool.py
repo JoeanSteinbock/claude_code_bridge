@@ -36,6 +36,12 @@ class BaseSessionWorker(threading.Thread, Generic[TaskT, ResultT]):
                 task = self._q.get(timeout=0.2)
             except queue.Empty:
                 continue
+
+            # Skip cancelled/expired tasks
+            if hasattr(task, 'cancelled') and task.cancelled:
+                task.done_event.set()
+                continue
+
             try:
                 task.result = self._handle_task(task)
             except Exception as exc:

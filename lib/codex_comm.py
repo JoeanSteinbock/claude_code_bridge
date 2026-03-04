@@ -270,8 +270,34 @@ class CodexLogReader:
     def _latest_log(self) -> Optional[Path]:
         preferred = self._preferred_log
         if preferred and preferred.exists():
-            # If we're bound to a specific session id, prefer that log without cross-session scanning.
+            # If we're bound to a specific session id, check if there's a newer session
             if self._session_id_filter:
+                # Periodically check for newer sessions (every 10 seconds)
+                now = time.time()
+                if not hasattr(self, '_last_session_check'):
+                    self._last_session_check = now
+
+                if now - self._last_session_check >= 10.0:
+                    self._last_session_check = now
+                    # Temporarily disable filter to scan all sessions
+                    old_filter = self._session_id_filter
+                    self._session_id_filter = None
+                    latest = self._scan_latest()
+                    self._session_id_filter = old_filter
+
+                    if latest and latest != preferred:
+                        try:
+                            preferred_mtime = preferred.stat().st_mtime
+                            latest_mtime = latest.stat().st_mtime
+                            if latest_mtime > preferred_mtime + 5.0:  # At least 5s newer
+                                self._debug(f"[Active Detection] Found newer session, switching: {latest}")
+                                self._preferred_log = latest
+                                # Clear filter to allow reading new session
+                                self._session_id_filter = None
+                                return latest
+                        except OSError:
+                            pass
+
                 self._debug(f"Using preferred log (bound): {preferred}")
                 return preferred
 

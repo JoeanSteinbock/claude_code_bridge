@@ -644,7 +644,9 @@ class TmuxBackend(TerminalBackend):
                 self._tmux_run(["send-keys", "-t", session, "-l", sanitized], check=True)
                 self._tmux_run(["send-keys", "-t", session, "Enter"], check=True)
                 return
-            buffer_name = f"ccb-tb-{os.getpid()}-{int(time.time() * 1000)}"
+            # Use random suffix to avoid collision under high concurrency
+            import random
+            buffer_name = f"ccb-tb-{os.getpid()}-{int(time.time() * 1000)}-{random.randint(1000, 9999)}"
             self._tmux_run(["load-buffer", "-b", buffer_name, "-"], check=True, input_bytes=sanitized.encode("utf-8"))
             try:
                 self._tmux_run(["paste-buffer", "-t", session, "-b", buffer_name, "-p"], check=True)
@@ -658,7 +660,9 @@ class TmuxBackend(TerminalBackend):
 
         # Pane-oriented: bracketed paste + unique tmux buffer + cleanup
         self._ensure_not_in_copy_mode(pane_id)
-        buffer_name = f"ccb-tb-{os.getpid()}-{int(time.time() * 1000)}"
+        # Use random suffix to avoid collision under high concurrency
+        import random
+        buffer_name = f"ccb-tb-{os.getpid()}-{int(time.time() * 1000)}-{random.randint(1000, 9999)}"
         self._tmux_run(["load-buffer", "-b", buffer_name, "-"], check=True, input_bytes=sanitized.encode("utf-8"))
         try:
             self._tmux_run(["paste-buffer", "-p", "-t", pane_id, "-b", buffer_name], check=True)
@@ -909,24 +913,22 @@ class WeztermBackend(TerminalBackend):
             time.sleep(enter_delay)
 
         env_method_raw = os.environ.get("CCB_WEZTERM_ENTER_METHOD")
-        # Default behavior is intentionally unchanged on non-Windows platforms:
-        # previously we used `send-text` with a CR byte; keep that unless the user overrides.
-        default_method = "auto" if os.name == "nt" else "text"
+        # Default to "auto" (prefer key injection) on all platforms for better TUI compatibility
+        default_method = "auto"
         method = (env_method_raw or default_method).strip().lower()
         if method not in {"auto", "key", "text"}:
             method = default_method
 
-        # Retry mechanism for reliability (Windows native occasionally drops Enter)
+        # Retry mechanism for reliability
         max_retries = 3
         for attempt in range(max_retries):
-            # Only enable "auto key" behavior by default on native Windows.
-            # Users can force key injection everywhere via CCB_WEZTERM_ENTER_METHOD=key.
-            if method == "key" or (method == "auto" and os.name == "nt"):
+            # Try key injection first (works better with raw-mode TUIs)
+            if method in {"key", "auto"}:
                 if self._send_key_cli(pane_id, "Enter"):
                     return
 
             # Fallback: send CR byte; works for shells/readline, but not for all raw-mode TUIs.
-            if method in {"auto", "text", "key"}:
+            if method in {"auto", "text"}:
                 result = _run(
                     [*self._cli_base_args(), "send-text", "--pane-id", pane_id, "--no-paste"],
                     input=b"\r",

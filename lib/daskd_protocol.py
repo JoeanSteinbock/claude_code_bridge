@@ -87,6 +87,10 @@ def extract_reply_for_req(text: str, req_id: str) -> str:
     target_idxs = [i for i in done_idxs if target_re.match(lines[i] or "")]
 
     if not target_idxs:
+        # No CCB_DONE for our req_id found
+        # If there are other CCB_DONE markers, this is likely old content - return empty
+        if done_idxs:
+            return ""  # Prevent returning old content
         return strip_done_text(text, req_id)
 
     target_i = target_idxs[-1]

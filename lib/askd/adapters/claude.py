@@ -546,11 +546,17 @@ class ClaudeAdapter(BaseProviderAdapter):
             task, session, session_key, started_ms, log_reader, state, backend, pane_id, deadline
         )
         result.reply = self._postprocess_reply(req, result.reply)
-        self._finalize_result(result, req)
+        self._finalize_result(result, req, task)
         return result
 
-    def _finalize_result(self, result: ProviderResult, req: ProviderRequest) -> None:
+    def _finalize_result(self, result: ProviderResult, req: ProviderRequest, task: QueuedTask) -> None:
         _write_log(f"[INFO] done provider=claude req_id={result.req_id} exit={result.exit_code}")
+
+        # Skip completion hook for cancelled tasks
+        if task.cancelled:
+            _write_log(f"[INFO] Task cancelled, skipping completion hook: req_id={task.req_id}")
+            return
+
         _write_log(f"[INFO] notify_completion caller={req.caller} done_seen={result.done_seen} email_req_id={req.email_req_id}")
         notify_completion(
             provider="claude",
