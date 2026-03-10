@@ -14,7 +14,7 @@ from askd.adapters.base import BaseProviderAdapter, ProviderRequest, ProviderRes
 from askd_runtime import log_path, write_log
 from ccb_protocol import REQ_ID_PREFIX, is_done_text, strip_done_text, extract_reply_for_req, wrap_codex_prompt
 from caskd_session import CodexProjectSession, compute_session_key, load_project_session
-from codex_comm import CodexLogReader
+from codex_comm import CodexCommunicator, CodexLogReader
 from completion_hook import (
     COMPLETION_STATUS_CANCELLED,
     COMPLETION_STATUS_COMPLETED,
@@ -46,6 +46,28 @@ def _tail_state_for_log(log_path_val: Optional[Path], *, tail_bytes: int) -> dic
     return {"log_path": log_path_val, "offset": offset}
 
 
+def _scan_latest_any_log(work_dir: Path) -> Optional[Path]:
+    try:
+        return CodexLogReader(log_path=None, session_id_filter=None, work_dir=work_dir).current_log_path()
+    except Exception:
+        return None
+
+
+def _is_log_stale(preferred: Optional[Path], latest: Optional[Path], threshold_s: float) -> bool:
+    if not latest:
+        return False
+    if not preferred or not preferred.exists():
+        return True
+    if threshold_s <= 0:
+        return False
+    try:
+        preferred_mtime = preferred.stat().st_mtime
+        latest_mtime = latest.stat().st_mtime
+    except OSError:
+        return True
+    return latest_mtime - preferred_mtime >= threshold_s
+
+
 class CodexAdapter(BaseProviderAdapter):
     """Adapter for Codex (WezTerm) provider."""
 
@@ -69,6 +91,7 @@ class CodexAdapter(BaseProviderAdapter):
 
     def handle_task(self, task: QueuedTask) -> ProviderResult:
         started_ms = _now_ms()
+        started_at = time.time()
         req = task.request
         work_dir = Path(req.work_dir)
         _write_log(f"[INFO] start provider=codex req_id={task.req_id} work_dir={req.work_dir} caller={req.caller}")
@@ -137,6 +160,10 @@ class CodexAdapter(BaseProviderAdapter):
         last_pane_check = time.time()
         default_interval = "5.0" if is_windows() else "2.0"
         pane_check_interval = float(os.environ.get("CCB_CASKD_PANE_CHECK_INTERVAL", default_interval))
+        stale_grace_s = float(os.environ.get("CCB_CASKD_STALE_LOG_GRACE_SECONDS", "2.5"))
+        stale_check_interval = float(os.environ.get("CCB_CASKD_STALE_LOG_CHECK_INTERVAL", "1.0"))
+        stale_threshold_s = float(os.environ.get("CCB_CODEX_STALE_LOG_SECONDS", "10.0"))
+        last_stale_check = time.time()
 
         while True:
             # Check for cancellation
@@ -183,6 +210,38 @@ class CodexAdapter(BaseProviderAdapter):
             event, state = reader.wait_for_event(state, wait_step)
 
             if event is None:
+                # Stale log detection: if no anchor and no chunks yet,
+                # check whether a newer session log appeared (e.g. after pane restart).
+                if (not anchor_seen) and (not chunks):
+                    now = time.time()
+                    if now - started_at >= stale_grace_s and now - last_stale_check >= stale_check_interval:
+                        last_stale_check = now
+                        latest_log = _scan_latest_any_log(Path(session.work_dir))
+                        current_log = state.get("log_path")
+                        if isinstance(current_log, str):
+                            current_log = Path(current_log)
+                        if latest_log and latest_log != current_log and _is_log_stale(current_log, latest_log, stale_threshold_s):
+                            reader = CodexLogReader(
+                                log_path=latest_log,
+                                session_id_filter=None,
+                                work_dir=Path(session.work_dir),
+                            )
+                            state = reader.capture_state()
+                            fallback_scan = True
+                            try:
+                                new_session_id = CodexCommunicator._extract_session_id(latest_log)
+                            except Exception:
+                                new_session_id = None
+                            try:
+                                session.update_codex_log_binding(
+                                    log_path=str(latest_log),
+                                    session_id=new_session_id,
+                                )
+                            except Exception:
+                                pass
+                            preferred_log = str(latest_log)
+                            codex_session_id = new_session_id or None
+                            _write_log(f"[WARN] stale codex log detected; switching to {latest_log}")
                 continue
 
             role, text = event
