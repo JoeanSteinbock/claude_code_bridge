@@ -1827,20 +1827,26 @@ class AILauncher:
             if not candidate or candidate in seen:
                 continue
             seen.add(candidate)
-            project_hash = hashlib.sha256(candidate.encode()).hexdigest()
-            chats_dir = gemini_root / project_hash / "chats"
-            if not chats_dir.exists():
-                continue
-            session_files = list(chats_dir.glob("session-*.json"))
-            if session_files:
-                resume_dir = None
-                try:
-                    p = Path(candidate)
-                    if p.is_dir():
-                        resume_dir = p
-                except Exception:
+            # Gemini CLI has used both sha256(cwd) and Path(cwd).name as the directory name.
+            # Try both to support all versions.
+            dir_names = [
+                hashlib.sha256(candidate.encode()).hexdigest(),
+                Path(candidate).name,
+            ]
+            for dir_name in dir_names:
+                chats_dir = gemini_root / dir_name / "chats"
+                if not chats_dir.exists():
+                    continue
+                session_files = list(chats_dir.glob("session-*.json"))
+                if session_files:
                     resume_dir = None
-                return project_hash, True, resume_dir
+                    try:
+                        p = Path(candidate)
+                        if p.is_dir():
+                            resume_dir = p
+                    except Exception:
+                        resume_dir = None
+                    return dir_name, True, resume_dir
 
         return None, False, None
 
@@ -1923,6 +1929,36 @@ class AILauncher:
         return cmd
 
     def _opencode_resume_allowed(self) -> bool:
+        target_dir = _normalize_path_for_match(str(self.project_root))
+        if not target_dir:
+            return False
+
+        # Newer OpenCode versions store sessions in an SQLite database.
+        xdg = (os.environ.get("XDG_DATA_HOME") or "").strip()
+        db_candidates = []
+        if xdg:
+            db_candidates.append(Path(xdg) / "opencode/opencode.db")
+        db_candidates.append(Path.home() / ".local/share/opencode/opencode.db")
+        for db_path in db_candidates:
+            if not db_path.exists():
+                continue
+            try:
+                import sqlite3
+                conn = sqlite3.connect(str(db_path))
+                try:
+                    row = conn.execute(
+                        "SELECT id FROM session WHERE directory = ? AND time_archived IS NULL "
+                        "ORDER BY time_updated DESC LIMIT 1",
+                        (target_dir,),
+                    ).fetchone()
+                    if row:
+                        return True
+                finally:
+                    conn.close()
+            except Exception:
+                pass
+
+        # Older OpenCode versions store sessions as JSON files.
         try:
             from opencode_comm import OPENCODE_STORAGE_ROOT
         except Exception:
@@ -1931,10 +1967,6 @@ class AILauncher:
         root = Path(OPENCODE_STORAGE_ROOT)
         sessions_root = root / "session"
         if not sessions_root.exists():
-            return False
-
-        target_dir = _normalize_path_for_match(str(self.project_root))
-        if not target_dir:
             return False
 
         def _load_json(path: Path) -> dict:
