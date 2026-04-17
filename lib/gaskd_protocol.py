@@ -6,8 +6,10 @@ from dataclasses import dataclass
 from ccb_protocol import (
     DONE_PREFIX,
     REQ_ID_PREFIX,
+    channel_reply_instruction,
     is_done_text,
     make_req_id,
+    reply_language_instruction,
     strip_done_text,
 )
 
@@ -15,16 +17,19 @@ from ccb_protocol import (
 ANY_DONE_LINE_RE = re.compile(r"^\s*CCB_DONE:\s*(?:[0-9a-f]{32}|\d{8}-\d{6}-\d{3}-\d+-\d+)\s*$", re.IGNORECASE)
 
 
-def wrap_gemini_prompt(message: str, req_id: str) -> str:
+def wrap_gemini_prompt(message: str, req_id: str, caller: str = "") -> str:
     message = (message or "").rstrip()
+    channel = channel_reply_instruction(caller)
+    channel_line = f"4. {channel}\n" if channel else ""
     return (
         f"{REQ_ID_PREFIX} {req_id}\n\n"
         f"{message}\n\n"
         "IMPORTANT — you MUST follow these rules:\n"
-        "1. Reply in English with an execution summary. Do not stay silent.\n"
+        f"1. {reply_language_instruction(message)} Include an execution summary. Do not stay silent.\n"
         "2. Your FINAL line MUST be exactly (copy verbatim, no extra text):\n"
         f"   {DONE_PREFIX} {req_id}\n"
         "3. Do NOT omit, modify, or paraphrase the line above.\n"
+        f"{channel_line}"
     )
 
 

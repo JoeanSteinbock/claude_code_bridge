@@ -9,8 +9,10 @@ from ccb_protocol import (
     BEGIN_PREFIX,
     DONE_PREFIX,
     REQ_ID_PREFIX,
+    channel_reply_instruction,
     is_done_text,
     make_req_id,
+    reply_language_instruction,
     strip_done_text,
 )
 
@@ -36,15 +38,6 @@ def _env_bool(name: str, default: bool = True) -> bool:
     if val in {"1", "true", "yes", "on"}:
         return True
     return default
-
-
-def _language_hint() -> str:
-    lang = (os.environ.get("CCB_REPLY_LANG") or os.environ.get("CCB_LANG") or "").strip().lower()
-    if lang in {"zh", "cn", "chinese"}:
-        return "Reply in Chinese."
-    if lang in {"en", "english"}:
-        return "Reply in English."
-    return ""
 
 
 def _load_claude_skills() -> str:
@@ -120,7 +113,7 @@ def extract_reply_for_req(text: str, req_id: str) -> str:
     return "\n".join(segment).rstrip()
 
 
-def wrap_claude_prompt(message: str, req_id: str) -> str:
+def wrap_claude_prompt(message: str, req_id: str, caller: str = "") -> str:
     message = (message or "").rstrip()
     skills = _load_claude_skills()
     if skills:
@@ -128,9 +121,12 @@ def wrap_claude_prompt(message: str, req_id: str) -> str:
     extra_lines: list[str] = []
     if _wants_markdown_table(message):
         extra_lines.append("If asked for a Markdown table, output only pipe-and-dash Markdown table syntax (no box-drawing characters).")
-    lang_hint = _language_hint()
+    lang_hint = reply_language_instruction(message)
     if lang_hint:
         extra_lines.append(lang_hint)
+    channel_hint = channel_reply_instruction(caller)
+    if channel_hint:
+        extra_lines.append(channel_hint)
     extra = "\n".join(extra_lines).strip()
     if extra:
         extra = f"{extra}\n\n"
@@ -138,9 +134,13 @@ def wrap_claude_prompt(message: str, req_id: str) -> str:
         f"{REQ_ID_PREFIX} {req_id}\n\n"
         f"{message}\n\n"
         f"{extra}"
-        "Reply using exactly this format:\n"
+        "CRITICAL — reply delivery protocol:\n"
+        f"Your reply is only delivered if it ends with `{DONE_PREFIX} {req_id}` on its own line.\n"
+        "If you skip this line, the user sees nothing — no matter how much work you did.\n"
+        "Finish every turn (success OR failure) with the done-line. Do not end your turn on a tool call.\n\n"
+        "Exact format:\n"
         f"{BEGIN_PREFIX} {req_id}\n"
-        "<reply>\n"
+        "<your reply text>\n"
         f"{DONE_PREFIX} {req_id}\n"
     )
 

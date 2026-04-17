@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 import secrets
 from dataclasses import dataclass
+import os
 
 
 REQ_ID_PREFIX = "CCB_REQ_ID:"
@@ -56,14 +57,52 @@ def make_req_id() -> str:
     return f"{now.strftime('%Y%m%d-%H%M%S')}-{ms:03d}-{os.getpid()}-{_req_id_counter}"
 
 
-def wrap_codex_prompt(message: str, req_id: str) -> str:
+def reply_language_instruction(message: str = "") -> str:
+    """
+    Return a language instruction for provider wrappers.
+
+    Priority:
+    1. Explicit env override via CCB_REPLY_LANG / CCB_LANG
+    2. Default: reply in the same language as the user's message
+    """
+    lang = (os.environ.get("CCB_REPLY_LANG") or os.environ.get("CCB_LANG") or "").strip().lower()
+    if lang in {"zh", "cn", "chinese"}:
+        return "Reply in Chinese."
+    if lang in {"en", "english"}:
+        return "Reply in English."
+    return "Reply in the same language as the user's message."
+
+
+def channel_reply_instruction(caller: str = "") -> str:
+    """
+    Return a channel-formatting directive so providers shape their reply for the
+    channel the request came from (Telegram vs. terminal, today).
+
+    Returns an empty string for the default terminal/provider-to-provider case
+    so existing behavior is unchanged.
+    """
+    c = (caller or "").strip().lower()
+    if c == "telegram":
+        return (
+            "This reply will be posted to Telegram. Use Telegram-friendly Markdown "
+            "(short paragraphs, `inline code`, triple-backtick code blocks only when essential). "
+            "Do not use ANSI colors, box-drawing characters, or terminal-only formatting. "
+            "Be concise — aim for under ~20 lines unless the user asked for detail."
+        )
+    return ""
+
+
+def wrap_codex_prompt(message: str, req_id: str, caller: str = "") -> str:
     message = (message or "").rstrip()
+    channel = channel_reply_instruction(caller)
+    channel_line = f"- {channel}\n" if channel else ""
     return (
         f"{REQ_ID_PREFIX} {req_id}\n\n"
         f"{message}\n\n"
         "IMPORTANT:\n"
         "- Reply normally.\n"
-        "- Reply normally, in English.\n"
+        f"- {reply_language_instruction(message)}\n"
+        f"{channel_line}"
         "- End your reply with this exact final line (verbatim, on its own line):\n"
         f"{DONE_PREFIX} {req_id}\n"
     )

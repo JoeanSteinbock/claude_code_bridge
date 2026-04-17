@@ -122,7 +122,7 @@ class CodebuddyAdapter(BaseProviderAdapter):
         log_reader = CodebuddyLogReader(work_dir=Path(session.work_dir), pane_log_path=pane_log_path)
         state = log_reader.capture_state()
 
-        prompt = wrap_codebuddy_prompt(req.message, task.req_id)
+        prompt = wrap_codebuddy_prompt(req.message, task.req_id, caller=req.caller)
         backend.send_text(pane_id, prompt)
 
         deadline = None if float(req.timeout_s) < 0.0 else (time.time() + float(req.timeout_s))
@@ -224,6 +224,8 @@ class CodebuddyAdapter(BaseProviderAdapter):
             email_msg_id=req.email_msg_id,
             email_from=req.email_from,
             work_dir=req.work_dir,
+            caller_pane_id=req.caller_pane_id,
+            caller_terminal=req.caller_terminal,
         )
 
         result = ProviderResult(

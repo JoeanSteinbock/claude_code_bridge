@@ -8,8 +8,10 @@ from pathlib import Path
 from ccb_protocol import (
     DONE_PREFIX,
     REQ_ID_PREFIX,
+    channel_reply_instruction,
     is_done_text,
     make_req_id,
+    reply_language_instruction,
     strip_done_text,
 )
 
@@ -55,16 +57,19 @@ def _load_droid_skills() -> str:
     return _SKILL_CACHE
 
 
-def wrap_droid_prompt(message: str, req_id: str) -> str:
+def wrap_droid_prompt(message: str, req_id: str, caller: str = "") -> str:
     message = (message or "").rstrip()
     skills = _load_droid_skills()
     if skills:
         message = f"{skills}\n\n{message}".strip()
+    channel = channel_reply_instruction(caller)
+    channel_line = f"- {channel}\n" if channel else ""
     return (
         f"{REQ_ID_PREFIX} {req_id}\n\n"
         f"{message}\n\n"
         "IMPORTANT:\n"
-        "- Reply with an execution summary, in English. Do not stay silent.\n"
+        f"- {reply_language_instruction(message)} Include an execution summary. Do not stay silent.\n"
+        f"{channel_line}"
         "- End your reply with this exact final line (verbatim, on its own line):\n"
         f"{DONE_PREFIX} {req_id}\n"
     )

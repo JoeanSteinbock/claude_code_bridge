@@ -120,6 +120,9 @@ class UnifiedAskDaemon:
         self.registry = registry or ProviderRegistry()
         self.pool = _UnifiedWorkerPool(self.registry)
         self.work_dir = work_dir
+        # Keyed by id(task) because QueuedTask is an unfrozen dataclass and thus unhashable.
+        self._active_tasks: dict = {}
+        self._active_tasks_lock = threading.Lock()
 
     def _handle_request(self, msg: dict) -> dict:
         """Handle an incoming request."""
@@ -169,6 +172,8 @@ class UnifiedAskDaemon:
                 email_req_id=str(msg.get("email_req_id") or ""),
                 email_msg_id=str(msg.get("email_msg_id") or ""),
                 email_from=str(msg.get("email_from") or ""),
+                caller_pane_id=str(msg.get("caller_pane_id") or ""),
+                caller_terminal=str(msg.get("caller_terminal") or ""),
             )
         except Exception as exc:
             return {
@@ -191,16 +196,23 @@ class UnifiedAskDaemon:
                 "reply": f"Failed to submit task for provider: {provider}",
             }
 
-        wait_timeout = None if float(request.timeout_s) < 0.0 else (float(request.timeout_s) + 5.0)
-        task.done_event.wait(timeout=wait_timeout)
-        result = task.result
+        task_key = id(task)
+        with self._active_tasks_lock:
+            self._active_tasks[task_key] = task
+        try:
+            wait_timeout = None if float(request.timeout_s) < 0.0 else (float(request.timeout_s) + 5.0)
+            task.done_event.wait(timeout=wait_timeout)
+            result = task.result
 
-        # If timeout occurred and task is still running, mark it as cancelled
-        if not result and not task.done_event.is_set():
-            _write_log(f"[WARN] Task timeout, marking as cancelled: provider={provider} req_id={task.req_id}")
-            task.cancelled = True
-            if task.cancel_event:
-                task.cancel_event.set()
+            # If timeout occurred and task is still running, mark it as cancelled
+            if not result and not task.done_event.is_set():
+                _write_log(f"[WARN] Task timeout, marking as cancelled: provider={provider} req_id={task.req_id}")
+                task.cancelled = True
+                if task.cancel_event:
+                    task.cancel_event.set()
+        finally:
+            with self._active_tasks_lock:
+                self._active_tasks.pop(task_key, None)
 
         if not result:
             return {
@@ -231,6 +243,24 @@ class UnifiedAskDaemon:
             },
         }
 
+    def drain(self) -> None:
+        """Cancel all in-flight tasks so handler threads can exit promptly.
+
+        Called before httpd.shutdown() so ThreadingTCPServer.server_close doesn't
+        block for up to timeout_s joining handlers that are still waiting for a
+        provider reply (e.g. a Claude pane that's already gone).
+        """
+        with self._active_tasks_lock:
+            tasks = list(self._active_tasks.values())
+        for task in tasks:
+            try:
+                task.cancelled = True
+                if task.cancel_event:
+                    task.cancel_event.set()
+                task.done_event.set()
+            except Exception:
+                pass
+
     def serve_forever(self) -> int:
         """Start the daemon and serve requests."""
         from askd_server import AskDaemonServer
@@ -251,6 +281,7 @@ class UnifiedAskDaemon:
             request_handler=self._handle_request,
             request_queue_size=128,
             on_stop=_on_stop,
+            on_shutdown_requested=self.drain,
             work_dir=self.work_dir,
         )
         return server.serve_forever()

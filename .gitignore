@@ -16,6 +16,10 @@ tests/
 .ccb/history/
 .ccb/.*-session*
 .ccb/ccb.config
+.ccb/telegramd.json
+.ccb/telegramd.pid
+.ccb/telegramd.log
+.ccb/telegram_downloads/
 .codex-session
 .gemini-session
 .claude-session

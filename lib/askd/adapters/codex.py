@@ -133,7 +133,7 @@ class CodexAdapter(BaseProviderAdapter):
                 status=COMPLETION_STATUS_FAILED,
             )
 
-        prompt = wrap_codex_prompt(req.message, task.req_id)
+        prompt = wrap_codex_prompt(req.message, task.req_id, caller=req.caller)
         preferred_log = session.codex_session_path or None
         codex_session_id = session.codex_session_id or None
         reader = CodexLogReader(
@@ -329,6 +329,8 @@ class CodexAdapter(BaseProviderAdapter):
             email_msg_id=req.email_msg_id,
             email_from=req.email_from,
             work_dir=req.work_dir,
+            caller_pane_id=req.caller_pane_id,
+            caller_terminal=req.caller_terminal,
         )
 
         return result

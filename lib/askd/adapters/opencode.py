@@ -154,7 +154,7 @@ class OpenCodeAdapter(BaseProviderAdapter):
         except Exception:
             pass
 
-        prompt = wrap_opencode_prompt(req.message, task.req_id)
+        prompt = wrap_opencode_prompt(req.message, task.req_id, caller=req.caller)
         backend.send_text(pane_id, prompt)
 
         # Async mode: timeout_s == 0 means fire-and-forget
@@ -238,6 +238,8 @@ class OpenCodeAdapter(BaseProviderAdapter):
             email_msg_id=req.email_msg_id,
             email_from=req.email_from,
             work_dir=req.work_dir,
+            caller_pane_id=req.caller_pane_id,
+            caller_terminal=req.caller_terminal,
         )
 
         result = ProviderResult(

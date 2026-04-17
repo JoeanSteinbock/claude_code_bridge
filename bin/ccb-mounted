@@ -66,7 +66,16 @@ if [[ "$OSTYPE" == "msys" ]] || [[ "$OSTYPE" == "cygwin" ]] || [[ -n "${WINDIR:-
   done
 else
   # Linux/macOS: use pgrep
-  ONLINE=$(pgrep -af "bin/[cglod]askd$" 2>/dev/null | grep -oE "[cglod]askd" | sort -u || true)
+  # Match both legacy per-provider daemons (caskd/gaskd/laskd/oaskd/daskd)
+  # and the unified askd daemon which serves all providers.
+  # Use `-lf` (portable on BSD/macOS + Linux procps) — BSD pgrep has no `-a`.
+  ONLINE=$(pgrep -lf "bin/[cglod]?askd$" 2>/dev/null | grep -oE "[cglod]?askd" | sort -u || true)
+
+  # If the unified askd is running, every provider with a session file is mounted.
+  UNIFIED_ONLINE=false
+  if echo "$ONLINE" | grep -qx "askd"; then
+    UNIFIED_ONLINE=true
+  fi
 
   MOUNTED=""
   for pair in $PROVIDERS; do
@@ -77,7 +86,9 @@ else
     if [[ -f "$CWD/.ccb/.${provider}-session" ]] || [[ -f "$CWD/.ccb_config/.${provider}-session" ]] || [[ -f "$CWD/.${provider}-session" ]]; then
       # Check daemon is online
       IS_ONLINE=false
-      if echo "$ONLINE" | grep -q "${daemon}d"; then
+      if [[ "$UNIFIED_ONLINE" == true ]]; then
+        IS_ONLINE=true
+      elif echo "$ONLINE" | grep -q "${daemon}d"; then
         IS_ONLINE=true
       fi
 

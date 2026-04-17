@@ -402,6 +402,7 @@ ccb codex,gemini,opencode,claude  # Start all four (commas)
 ccb -r codex gemini     # Resume last session for Codex + Gemini
 ccb -a codex gemini opencode  # Auto-approval mode with multiple providers
 ccb -a -r codex gemini opencode claude  # Auto + resume for all providers
+ccb -R codex gemini     # Replace the existing ccb instance for this directory, then start Codex + Gemini
 
 tmux tip: CCB's tmux status/pane theming is enabled only while CCB is running.
 tmux tip: press `Ctrl+b` then `Space` to cycle tmux layouts. You can press it repeatedly to keep switching layouts.
@@ -415,6 +416,7 @@ Note: `ccb up` is removed; use `ccb ...` or configure `ccb.config`.
 | :--- | :--- | :--- |
 | `-r` | Resume previous session context | `ccb -r` |
 | `-a` | Auto-mode, skip permission prompts | `ccb -a` |
+| `-R` | Replace existing ccb instance for this directory before starting | `ccb -R codex` |
 | `-h` | Show help information | `ccb -h` |
 | `-v` | Show version and check for updates | `ccb -v` |
 
@@ -426,6 +428,30 @@ Default lookup order:
 Simple format (recommended):
 ```text
 codex,gemini,opencode,claude
+```
+
+Telegram bridge can also be configured per project in `.ccb/ccb.config`:
+
+```json
+{
+  "providers": ["codex", "gemini", "opencode", "claude"],
+  "telegram": {
+    "enabled": true,
+    "bot_token": "123456:telegram-bot-token",
+    "allowed_chat_ids": ["123456789"],
+    "default_provider": "claude",
+    "default_work_dir": ".",
+    "broadcast_providers": ["claude", "codex", "gemini"]
+  }
+}
+```
+
+Useful commands:
+
+```bash
+ccb telegram config --token <bot-token> --chat-id <chat-id> --enable
+ccb telegram start
+ccb telegram status
 ```
 
 Enable cmd pane (default title/command):

@@ -53,8 +53,8 @@ if backend_env and not os.environ.get("CCB_BACKEND_ENV"):
     os.environ["CCB_BACKEND_ENV"] = backend_env
 
 VERSION = "5.2.9"
-GIT_COMMIT = "c539e79"
-GIT_DATE = "2026-02-25"
+GIT_COMMIT = "2bb9a1b"
+GIT_DATE = "2026-04-05"
 
 _WIN_DRIVE_RE = re.compile(r"^[A-Za-z]:([/\\\\]|$)")
 _MNT_DRIVE_RE = re.compile(r"^/mnt/([A-Za-z])/(.*)$")
@@ -739,6 +739,60 @@ class AILauncher:
             return str(self.wezterm_panes.get(prov, "") or "")
         return str(self.tmux_panes.get(prov, "") or "")
 
+    def _notify_telegram_startup(self) -> None:
+        """Fire-and-forget startup notification via the project Telegram bot."""
+        project_name = self.project_root.name or str(self.project_root)
+        providers = ", ".join(self.providers)
+        help_lines = [
+            f"CCB started for `{project_name}`",
+            f"Path: `{self.project_root}`",
+            f"Terminal: `{self.terminal_type}`",
+            f"Models: {providers}",
+            "",
+            "Commands:",
+            "  `claude: your question`",
+            "  `codex: your question`",
+            "  " + "  ".join([f"`/{p} ...`" for p in self.providers]),
+            "  `/ask <provider> ...`",
+            "  `all: compare answers`",
+            "  `/help`",
+            "  `/providers`",
+        ]
+        message = "\n".join(help_lines)
+        work_dir = self.project_root
+
+        def _send() -> None:
+            try:
+                from telegramd_client import send_telegram_message
+                send_telegram_message(message, work_dir=work_dir, http_timeout=10.0)
+            except Exception:
+                pass
+
+        threading.Thread(target=_send, name="ccb-telegram-startup-notify", daemon=True).start()
+
+    def _notify_telegram_shutdown(self) -> None:
+        """Best-effort shutdown notification. Short timeout so cleanup isn't stalled."""
+        try:
+            from telegramd_client import send_telegram_message
+        except Exception:
+            return
+
+        project_name = self.project_root.name or str(self.project_root)
+        providers = ", ".join(self.providers)
+        message = "\n".join(
+            [
+                f"CCB stopped for `{project_name}`",
+                f"Path: `{self.project_root}`",
+                f"Models that were mounted: {providers}",
+                "",
+                "This chat is now unattended until CCB starts again.",
+            ]
+        )
+        try:
+            send_telegram_message(message, work_dir=self.project_root, http_timeout=5.0)
+        except Exception:
+            pass
+
     def _set_current_pane_label(self, provider: str) -> None:
         if self.terminal_type != "tmux":
             return
@@ -747,7 +801,7 @@ class AILauncher:
         try:
             backend = TmuxBackend()
             pane_id = backend.get_current_pane_id()
-            title = f"CCB-{provider.capitalize()}"
+            title = f"CCB-{provider.capitalize()}-{self.project_id[:8]}"
             backend.set_pane_title(pane_id, title)
             backend.set_pane_user_option(pane_id, "@ccb_agent", provider.capitalize())
         except Exception:
@@ -784,6 +838,45 @@ class AILauncher:
                 except Exception:
                     pass
                 # If not successful, continue to next provider
+
+    def _maybe_start_telegram_daemon(self, *, quiet: bool = True) -> None:
+        """Start the project Telegram daemon when config is valid and enabled."""
+        def _emit(msg: str, *, err: bool = False) -> None:
+            if quiet and not _env_bool("CCB_DEBUG", False):
+                return
+            print(msg, file=sys.stderr if err else sys.stdout)
+
+        try:
+            from telegram_bridge.config import is_configured, load_config
+            from telegram_bridge.daemon import is_daemon_running
+            from telegramd_client import start_telegram_service
+        except Exception as exc:
+            _emit(f"⚠️ Failed to import Telegram bridge modules: {exc}", err=True)
+            return
+
+        try:
+            config = load_config(self.project_root)
+        except Exception as exc:
+            _emit(f"⚠️ Failed to load Telegram config: {exc}", err=True)
+            return
+
+        if not getattr(config, "enabled", False):
+            return
+        if not is_configured(config, self.project_root):
+            return
+
+        try:
+            if is_daemon_running(self.project_root):
+                return
+        except Exception as exc:
+            _emit(f"⚠️ Failed to inspect Telegram daemon state: {exc}", err=True)
+            return
+
+        try:
+            if start_telegram_service(foreground=False, work_dir=self.project_root):
+                _emit("[telegramd] Auto-started Telegram bridge for this project")
+        except Exception as exc:
+            _emit(f"⚠️ Failed to auto-start Telegram bridge: {exc}", err=True)
 
     def _maybe_start_provider_daemon(self, provider: str, *, quiet: bool = False) -> None:
         def _bool_from_env(name: str):
@@ -1263,7 +1356,7 @@ class AILauncher:
             except StopIteration:
                 use_parent = None
 
-        pane_title_marker = f"CCB-{provider.capitalize()}"
+        pane_title_marker = f"CCB-{provider.capitalize()}-{self.project_id[:8]}"
         title_cmd = _build_pane_title_cmd(pane_title_marker)
         env_overrides = self._provider_env_overrides(provider)
         full_cmd = title_cmd + self._build_env_prefix(env_overrides) + _build_export_path_cmd(self.script_dir / "bin") + start_cmd
@@ -1827,20 +1920,26 @@ class AILauncher:
             if not candidate or candidate in seen:
                 continue
             seen.add(candidate)
-            project_hash = hashlib.sha256(candidate.encode()).hexdigest()
-            chats_dir = gemini_root / project_hash / "chats"
-            if not chats_dir.exists():
-                continue
-            session_files = list(chats_dir.glob("session-*.json"))
-            if session_files:
-                resume_dir = None
-                try:
-                    p = Path(candidate)
-                    if p.is_dir():
-                        resume_dir = p
-                except Exception:
+            # Gemini CLI has used both sha256(cwd) and Path(cwd).name as the directory name.
+            # Try both to support all versions.
+            dir_names = [
+                hashlib.sha256(candidate.encode()).hexdigest(),
+                Path(candidate).name,
+            ]
+            for dir_name in dir_names:
+                chats_dir = gemini_root / dir_name / "chats"
+                if not chats_dir.exists():
+                    continue
+                session_files = list(chats_dir.glob("session-*.json"))
+                if session_files:
                     resume_dir = None
-                return project_hash, True, resume_dir
+                    try:
+                        p = Path(candidate)
+                        if p.is_dir():
+                            resume_dir = p
+                    except Exception:
+                        resume_dir = None
+                    return dir_name, True, resume_dir
 
         return None, False, None
 
@@ -1923,6 +2022,36 @@ class AILauncher:
         return cmd
 
     def _opencode_resume_allowed(self) -> bool:
+        target_dir = _normalize_path_for_match(str(self.project_root))
+        if not target_dir:
+            return False
+
+        # Newer OpenCode versions store sessions in an SQLite database.
+        xdg = (os.environ.get("XDG_DATA_HOME") or "").strip()
+        db_candidates = []
+        if xdg:
+            db_candidates.append(Path(xdg) / "opencode/opencode.db")
+        db_candidates.append(Path.home() / ".local/share/opencode/opencode.db")
+        for db_path in db_candidates:
+            if not db_path.exists():
+                continue
+            try:
+                import sqlite3
+                conn = sqlite3.connect(str(db_path))
+                try:
+                    row = conn.execute(
+                        "SELECT id FROM session WHERE directory = ? AND time_archived IS NULL "
+                        "ORDER BY time_updated DESC LIMIT 1",
+                        (target_dir,),
+                    ).fetchone()
+                    if row:
+                        return True
+                finally:
+                    conn.close()
+            except Exception:
+                pass
+
+        # Older OpenCode versions store sessions as JSON files.
         try:
             from opencode_comm import OPENCODE_STORAGE_ROOT
         except Exception:
@@ -1931,10 +2060,6 @@ class AILauncher:
         root = Path(OPENCODE_STORAGE_ROOT)
         sessions_root = root / "session"
         if not sessions_root.exists():
-            return False
-
-        target_dir = _normalize_path_for_match(str(self.project_root))
-        if not target_dir:
             return False
 
         def _load_json(path: Path) -> dict:
@@ -2126,7 +2251,7 @@ class AILauncher:
 
         env_overrides = self._provider_env_overrides("codex")
         start_cmd = self._build_env_prefix(env_overrides) + _build_export_path_cmd(self.script_dir / "bin") + self._build_codex_start_cmd()
-        pane_title_marker = "CCB-Codex"
+        pane_title_marker = f"CCB-Codex-{self.project_id[:8]}"
 
         backend = TmuxBackend()
 
@@ -2217,7 +2342,7 @@ class AILauncher:
 
         env_overrides = self._provider_env_overrides("gemini")
         start_cmd = self._build_env_prefix(env_overrides) + _build_export_path_cmd(self.script_dir / "bin") + self._build_gemini_start_cmd()
-        pane_title_marker = "CCB-Gemini"
+        pane_title_marker = f"CCB-Gemini-{self.project_id[:8]}"
 
         backend = TmuxBackend()
 
@@ -2268,7 +2393,7 @@ class AILauncher:
 
         env_overrides = self._provider_env_overrides("opencode")
         start_cmd = self._build_env_prefix(env_overrides) + _build_export_path_cmd(self.script_dir / "bin") + self._build_opencode_start_cmd()
-        pane_title_marker = "CCB-OpenCode"
+        pane_title_marker = f"CCB-OpenCode-{self.project_id[:8]}"
 
         backend = TmuxBackend()
 
@@ -2322,7 +2447,7 @@ class AILauncher:
 
         env_overrides = self._provider_env_overrides("droid")
         start_cmd = self._build_env_prefix(env_overrides) + _build_export_path_cmd(self.script_dir / "bin") + self._build_droid_start_cmd()
-        pane_title_marker = "CCB-Droid"
+        pane_title_marker = f"CCB-Droid-{self.project_id[:8]}"
 
         backend = TmuxBackend()
 
@@ -2412,7 +2537,7 @@ class AILauncher:
             print("❌ Unable to determine current pane id for Codex", file=sys.stderr)
             return 1
 
-        pane_title_marker = "CCB-Codex"
+        pane_title_marker = f"CCB-Codex-{self.project_id[:8]}"
         if self.terminal_type == "tmux":
             try:
                 backend = TmuxBackend()
@@ -2525,7 +2650,7 @@ class AILauncher:
             print("❌ Unable to determine current pane id for Gemini", file=sys.stderr)
             return 1
 
-        pane_title_marker = "CCB-Gemini"
+        pane_title_marker = f"CCB-Gemini-{self.project_id[:8]}"
         if self.terminal_type == "tmux":
             try:
                 backend = TmuxBackend()
@@ -2560,7 +2685,7 @@ class AILauncher:
             print("❌ Unable to determine current pane id for OpenCode", file=sys.stderr)
             return 1
 
-        pane_title_marker = "CCB-OpenCode"
+        pane_title_marker = f"CCB-OpenCode-{self.project_id[:8]}"
         if self.terminal_type == "tmux":
             try:
                 backend = TmuxBackend()
@@ -2621,7 +2746,7 @@ class AILauncher:
             print("❌ Unable to determine current pane id for Droid", file=sys.stderr)
             return 1
 
-        pane_title_marker = "CCB-Droid"
+        pane_title_marker = f"CCB-Droid-{self.project_id[:8]}"
         if self.terminal_type == "tmux":
             try:
                 backend = TmuxBackend()
@@ -3170,7 +3295,7 @@ class AILauncher:
 
         start_cmd = " ".join(cmd_parts)
         full_cmd = (
-            _build_pane_title_cmd("CCB-Claude")
+            _build_pane_title_cmd(f"CCB-Claude-{self.project_id[:8]}")
             + self._build_env_prefix(env_overrides)
             + _build_export_path_cmd(self.script_dir / "bin")
             + start_cmd
@@ -3187,7 +3312,7 @@ class AILauncher:
             backend = TmuxBackend()
             pane_id = backend.create_pane("", run_cwd, direction=use_direction, percent=50, parent_pane=use_parent)
             backend.respawn_pane(pane_id, cmd=full_cmd, cwd=run_cwd, remain_on_exit=True)
-            backend.set_pane_title(pane_id, "CCB-Claude")
+            backend.set_pane_title(pane_id, f"CCB-Claude-{self.project_id[:8]}")
             backend.set_pane_user_option(pane_id, "@ccb_agent", "Claude")
             self.tmux_panes["claude"] = pane_id
 
@@ -3196,7 +3321,7 @@ class AILauncher:
                 session_id=self._read_local_claude_session_id(),
                 active=True,
                 pane_id=str(pane_id or ""),
-                pane_title_marker="CCB-Claude",
+                pane_title_marker=f"CCB-Claude-{self.project_id[:8]}",
                 terminal=self.terminal_type,
             )
         except Exception:
@@ -3322,6 +3447,13 @@ class AILauncher:
         except Exception:
             pass
 
+        # Best-effort Telegram shutdown notification after daemons are down so
+        # blocking HTTP calls cannot stall the watchdog / askd teardown.
+        try:
+            self._notify_telegram_shutdown()
+        except Exception:
+            pass
+
         if remove_runtime:
             import shutil
             if self.runtime_dir.exists():
@@ -3360,7 +3492,6 @@ class AILauncher:
 
         if not self._require_project_config_dir():
             return 2
-
         self._backfill_claude_session_work_dir_fields()
 
         if not self.providers:
@@ -3403,6 +3534,8 @@ class AILauncher:
         atexit.register(lambda: self.cleanup(**cleanup_kwargs))
         signal.signal(signal.SIGINT, lambda s, f: (self.cleanup(**cleanup_kwargs), sys.exit(0)))
         signal.signal(signal.SIGTERM, lambda s, f: (self.cleanup(**cleanup_kwargs), sys.exit(0)))
+        if hasattr(signal, "SIGHUP"):
+            signal.signal(signal.SIGHUP, lambda s, f: (self.cleanup(**cleanup_kwargs), sys.exit(0)))
 
         # Best-effort cleanup of leftover `tmpclaude-*-cwd` artifacts (can be disabled via env).
         try:
@@ -3447,7 +3580,7 @@ class AILauncher:
                     session_id=self._read_local_claude_session_id(),
                     active=True,
                     pane_id=str(self.anchor_pane_id or ""),
-                    pane_title_marker="CCB-Claude",
+                    pane_title_marker=f"CCB-Claude-{self.project_id[:8]}",
                     terminal=self.terminal_type,
                 )
             except Exception:
@@ -3489,6 +3622,18 @@ class AILauncher:
 
         # Start watchdog thread to monitor daemon health (provider-agnostic)
         self._start_daemon_watchdog()
+
+        # Auto-start Telegram only after panes, sessions, and warmups are in place.
+        try:
+            self._maybe_start_telegram_daemon()
+        except Exception:
+            pass
+
+        # Best-effort Telegram startup notification for this project.
+        try:
+            self._notify_telegram_startup()
+        except Exception:
+            pass
 
         try:
             try:
@@ -3657,6 +3802,17 @@ def cmd_start(args):
         pane_id = str(entry.get("pane_id") or "").strip()
         return record, pane_id
 
+    # Merge replace_existing from ccb.config (flags.replace_existing) with CLI.
+    # CLI takes precedence; config is a sticky default for this project.
+    try:
+        _early_cfg = load_start_config(work_dir)
+        _early_cfg_data = _early_cfg.data if isinstance(_early_cfg.data, dict) else {}
+        _early_flags = _early_cfg_data.get("flags") if isinstance(_early_cfg_data.get("flags"), dict) else {}
+        _cfg_replace_existing = bool(_early_flags.get("replace_existing") or _early_flags.get("replace"))
+    except Exception:
+        _cfg_replace_existing = False
+    effective_replace_existing = bool(getattr(args, "replace_existing", False) or _cfg_replace_existing)
+
     # Enforce single ccb instance per directory.
     lock_cwd = str(Path.cwd().resolve())
     ccb_lock = ProviderLock("ccb", timeout=0.1, cwd=lock_cwd)
@@ -3668,31 +3824,60 @@ def cmd_start(args):
             pid = ""
         pid_msg = f" (pid {pid})" if pid else ""
 
-        # Fast-path: if user requests a single provider, try activating its existing pane
-        # in the already-running instance instead of hard failing.
-        focus_provider = requested_providers[0] if len(requested_providers) == 1 else ""
-        if focus_provider:
-            record, pane_id = _existing_provider_pane_for_project(work_dir, focus_provider)
-            if record and pane_id:
-                try:
-                    backend = get_backend_for_session(record)
-                    if backend and backend.is_alive(pane_id):
-                        if os.environ.get("TMUX") or sys.stdin.isatty():
-                            backend.activate(pane_id)
-                        print(
-                            f"ℹ️ Reusing existing ccb instance for this directory{pid_msg}; "
-                            f"activated {focus_provider} pane {pane_id}.",
-                            file=sys.stderr,
-                        )
-                        return 0
-                except Exception:
-                    pass
+        if effective_replace_existing:
+            owner_pid = 0
+            try:
+                owner_pid = int(pid)
+            except Exception:
+                owner_pid = 0
 
-        print(f"❌ Another ccb instance is already running for this directory{pid_msg}.", file=sys.stderr)
-        print("💡 Only one ccb instance is allowed per directory.", file=sys.stderr)
-        if focus_provider:
-            print(f"💡 Try switching to the existing {focus_provider} pane in that ccb session.", file=sys.stderr)
-        return 2
+            if owner_pid <= 0:
+                print(
+                    "❌ Another ccb instance is already running for this directory, but its PID could not be determined.",
+                    file=sys.stderr,
+                )
+                print("💡 Stop the old instance first, then retry.", file=sys.stderr)
+                return 2
+
+            _source = "ccb.config (flags.replace_existing)" if (_cfg_replace_existing and not getattr(args, "replace_existing", False)) else "--replace-existing"
+            print(f"ℹ️ Replacing existing ccb instance for this directory (pid {owner_pid}) [{_source}].", file=sys.stderr)
+            if not _replace_existing_ccb_instance(lock_cwd, owner_pid):
+                print(
+                    f"❌ Failed to stop the existing ccb instance for this directory (pid {owner_pid}).",
+                    file=sys.stderr,
+                )
+                return 2
+
+            ccb_lock = ProviderLock("ccb", timeout=0.5, cwd=lock_cwd)
+            if not ccb_lock.try_acquire():
+                print("❌ Existing ccb instance exited, but the directory lock is still busy.", file=sys.stderr)
+                return 2
+        else:
+            # Fast-path: if user requests a single provider, try activating its existing pane
+            # in the already-running instance instead of hard failing.
+            focus_provider = requested_providers[0] if len(requested_providers) == 1 else ""
+            if focus_provider:
+                record, pane_id = _existing_provider_pane_for_project(work_dir, focus_provider)
+                if record and pane_id:
+                    try:
+                        backend = get_backend_for_session(record)
+                        if backend and backend.is_alive(pane_id):
+                            if os.environ.get("TMUX") or sys.stdin.isatty():
+                                backend.activate(pane_id)
+                            print(
+                                f"ℹ️ Reusing existing ccb instance for this directory{pid_msg}; "
+                                f"activated {focus_provider} pane {pane_id}.",
+                                file=sys.stderr,
+                            )
+                            return 0
+                    except Exception:
+                        pass
+
+            print(f"❌ Another ccb instance is already running for this directory{pid_msg}.", file=sys.stderr)
+            print("💡 Only one ccb instance is allowed per directory.", file=sys.stderr)
+            if focus_provider:
+                print(f"💡 Try switching to the existing {focus_provider} pane in that ccb session.", file=sys.stderr)
+            return 2
     atexit.register(ccb_lock.release)
 
     providers, cmd_enabled = requested_providers, _requested_cmd_enabled
@@ -3882,6 +4067,43 @@ def _kill_pid(pid: int, force: bool = False) -> bool:
         return True
     except Exception:
         return False
+
+
+def _replace_existing_ccb_instance(lock_cwd: str, pid: int, timeout_s: float = 8.0) -> bool:
+    """Terminate the ccb instance holding the directory lock and wait for release."""
+    if pid <= 0:
+        return False
+
+    # Stop the project's telegramd first. If we leave it running, the detached
+    # subprocess survives when we SIGKILL the old ccb and fights the new
+    # telegramd for getUpdates (HTTP 409), spawning orphan ask children.
+    try:
+        from telegramd_client import stop_telegram_service
+        stop_telegram_service(lock_cwd)
+    except Exception:
+        pass
+
+    if not _kill_pid(pid, force=False):
+        return False
+
+    deadline = time.time() + max(0.5, timeout_s)
+    while time.time() < deadline:
+        probe = ProviderLock("ccb", timeout=0.1, cwd=lock_cwd)
+        if probe.try_acquire():
+            probe.release()
+            return True
+        time.sleep(0.1)
+
+    _kill_pid(pid, force=True)
+    deadline = time.time() + 3.0
+    while time.time() < deadline:
+        probe = ProviderLock("ccb", timeout=0.1, cwd=lock_cwd)
+        if probe.try_acquire():
+            probe.release()
+            return True
+        time.sleep(0.1)
+
+    return False
 
 
 def cmd_kill(args):
@@ -4834,6 +5056,152 @@ def cmd_mail(argv: list[str]) -> int:
     return 1
 
 
+def cmd_telegram(argv: list[str]) -> int:
+    """Handle ccb telegram subcommands."""
+    parser = argparse.ArgumentParser(prog="ccb telegram", description="Telegram bridge commands")
+    subparsers = parser.add_subparsers(dest="subcommand", help="Telegram subcommands")
+
+    start_parser = subparsers.add_parser("start", help="Start Telegram bridge")
+    start_parser.add_argument("--foreground", action="store_true", help="Run in foreground")
+
+    subparsers.add_parser("stop", help="Stop Telegram bridge")
+    subparsers.add_parser("status", help="Show Telegram bridge status")
+    subparsers.add_parser("test", help="Test Telegram bot connection")
+
+    config_parser = subparsers.add_parser("config", help="Show or update Telegram bridge settings")
+    config_parser.add_argument("--token", help="Telegram bot token")
+    config_parser.add_argument("--chat-id", action="append", default=[], help="Allowed Telegram chat ID (repeatable)")
+    config_parser.add_argument("--clear-chat-ids", action="store_true", help="Clear allowed chat IDs")
+    config_parser.add_argument("--default-provider", help="Default provider for unprefixed messages")
+    config_parser.add_argument("--work-dir", help="Default work directory for ask requests")
+    config_parser.add_argument("--poll-interval", type=int, help="Polling interval seconds")
+    config_parser.add_argument("--long-poll-timeout", type=int, help="Telegram long-poll timeout seconds")
+    config_parser.add_argument("--request-timeout", type=int, help="ask timeout seconds")
+    config_parser.add_argument("--broadcast-provider", action="append", default=[], help="Provider used by 'all:' routing")
+    config_parser.add_argument("--acks", dest="acks", action="store_true", help="Enable processing acknowledgements")
+    config_parser.add_argument("--no-acks", dest="acks", action="store_false", help="Disable processing acknowledgements")
+    config_parser.add_argument("--enable", action="store_true", help="Enable Telegram bridge")
+    config_parser.add_argument("--disable", action="store_true", help="Disable Telegram bridge")
+    config_parser.set_defaults(acks=None)
+
+    args = parser.parse_args(argv)
+
+    if args.subcommand == "start":
+        try:
+            from telegramd_client import start_telegram_service
+
+            return 0 if start_telegram_service(foreground=args.foreground, work_dir=Path.cwd()) else 1
+        except ImportError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return 1
+
+    if args.subcommand == "stop":
+        try:
+            from telegramd_client import stop_telegram_service
+
+            return 0 if stop_telegram_service(Path.cwd()) else 1
+        except ImportError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return 1
+
+    if args.subcommand == "status":
+        try:
+            from telegramd_client import get_telegram_status
+
+            status = get_telegram_status(Path.cwd())
+            print("Telegram Bridge Status")
+            print("=" * 40)
+            print(f"  Configured: {'Yes' if status['configured'] else 'No'}")
+            print(f"  Enabled:    {'Yes' if status['enabled'] else 'No'}")
+            print(f"  Token:      {'Set' if status.get('bot_token_set') else 'Not set'}")
+            print(f"  Default:    {status.get('default_provider') or '-'}")
+            print(f"  Work Dir:   {status.get('default_work_dir') or str(Path.cwd())}")
+            chats = status.get("allowed_chat_ids") or []
+            print(f"  Chat IDs:   {', '.join(chats) if chats else '(all)'}")
+            daemon = status.get("daemon", {})
+            if daemon.get("running"):
+                print(f"  Daemon:     Running (PID: {daemon.get('pid')})")
+                if daemon.get("bot_username"):
+                    print(f"  Bot:        @{daemon.get('bot_username')}")
+            else:
+                print("  Daemon:     Stopped")
+            return 0
+        except ImportError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return 1
+
+    if args.subcommand == "test":
+        try:
+            from telegramd_client import test_telegram_connection
+
+            result = test_telegram_connection(Path.cwd())
+            print("Telegram Connection Test")
+            print("=" * 40)
+            if result.get("success"):
+                print(f"  OK: @{result.get('username') or 'unknown'} (id={result.get('id')})")
+                return 0
+            print(f"  Failed: {result.get('error') or 'unknown error'}")
+            return 1
+        except ImportError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return 1
+
+    if args.subcommand == "config":
+        try:
+            from telegramd_client import get_telegram_status, update_telegram_config
+
+            has_updates = any(
+                [
+                    args.token is not None,
+                    bool(args.chat_id),
+                    args.clear_chat_ids,
+                    args.default_provider is not None,
+                    args.work_dir is not None,
+                    args.poll_interval is not None,
+                    args.long_poll_timeout is not None,
+                    args.request_timeout is not None,
+                    bool(args.broadcast_provider),
+                    args.acks is not None,
+                    args.enable,
+                    args.disable,
+                ]
+            )
+
+            if has_updates:
+                update_telegram_config(
+                    work_dir=Path.cwd(),
+                    token=args.token,
+                    chat_ids=args.chat_id,
+                    clear_chat_ids=args.clear_chat_ids,
+                    default_provider=args.default_provider,
+                    default_work_dir=args.work_dir,
+                    polling_interval_seconds=args.poll_interval,
+                    long_poll_timeout_seconds=args.long_poll_timeout,
+                    request_timeout_seconds=args.request_timeout,
+                    send_acknowledgements=args.acks,
+                    enabled=(True if args.enable else False if args.disable else None),
+                    broadcast_providers=args.broadcast_provider or None,
+                )
+
+            status = get_telegram_status(Path.cwd())
+            print("Telegram Bridge Config")
+            print("=" * 40)
+            print(f"  Configured:      {'Yes' if status['configured'] else 'No'}")
+            print(f"  Enabled:         {'Yes' if status['enabled'] else 'No'}")
+            print(f"  Token:           {'Set' if status.get('bot_token_set') else 'Not set'}")
+            print(f"  Default Provider:{status.get('default_provider') or '-'}")
+            print(f"  Default Work Dir:{status.get('default_work_dir') or str(Path.cwd())}")
+            chats = status.get("allowed_chat_ids") or []
+            print(f"  Allowed Chat IDs:{', '.join(chats) if chats else '(all)'}")
+            return 0
+        except ImportError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return 1
+
+    parser.print_help()
+    return 1
+
+
 def cmd_droid_subcommand(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="ccb droid", description="Droid-specific commands")
     subparsers = parser.add_subparsers(dest="subcommand", help="Droid subcommands")
@@ -4904,10 +5272,14 @@ def main():
     if argv and argv[0] == "mail":
         return cmd_mail(argv[1:])
 
+    # Handle 'ccb telegram' subcommand
+    if argv and argv[0] == "telegram":
+        return cmd_telegram(argv[1:])
+
     start_parser = argparse.ArgumentParser(
         description="Claude AI unified launcher",
         add_help=True,
-        epilog="Other commands: ccb update | ccb version | ccb kill | ccb uninstall | ccb reinstall | ccb droid setup-delegation | ccb mail setup",
+        epilog="Other commands: ccb update | ccb version | ccb kill | ccb uninstall | ccb reinstall | ccb droid setup-delegation | ccb mail setup | ccb telegram config",
     )
     start_parser.add_argument(
         "providers",
@@ -4916,6 +5288,12 @@ def main():
     )
     start_parser.add_argument("-r", "--resume", "--restore", action="store_true", help="Resume context")
     start_parser.add_argument("-a", "--auto", action="store_true", help="Full auto permission mode")
+    start_parser.add_argument(
+        "-R",
+        "--replace-existing",
+        action="store_true",
+        help="Stop an existing ccb instance for this directory before starting",
+    )
     args = start_parser.parse_args(argv)
     return cmd_start(args)
 

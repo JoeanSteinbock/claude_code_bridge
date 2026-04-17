@@ -68,6 +68,7 @@ class AskDaemonServer:
         request_handler: RequestHandler,
         request_queue_size: Optional[int] = None,
         on_stop: Optional[Callable[[], None]] = None,
+        on_shutdown_requested: Optional[Callable[[], None]] = None,
         parent_pid: Optional[int] = None,
         managed: Optional[bool] = None,
         work_dir: Optional[str] = None,
@@ -80,6 +81,7 @@ class AskDaemonServer:
         self.request_handler = request_handler
         self.request_queue_size = request_queue_size
         self.on_stop = on_stop
+        self.on_shutdown_requested = on_shutdown_requested
         self.parent_pid = parent_pid if parent_pid is not None else _env_parent_pid()
         self.work_dir = work_dir or os.getcwd()
         env_managed = _env_truthy("CCB_MANAGED")
@@ -126,7 +128,7 @@ class AskDaemonServer:
 
                 if msg_type == f"{protocol_prefix}.shutdown":
                     self._write({"type": response_type, "v": 1, "id": msg.get("id"), "exit_code": 0, "reply": "OK"})
-                    threading.Thread(target=self.server.shutdown, daemon=True).start()
+                    threading.Thread(target=self.server._trigger_shutdown, daemon=True).start()
                     return
 
                 if msg_type != f"{protocol_prefix}.request":
@@ -175,6 +177,13 @@ class AskDaemonServer:
 
         class Server(socketserver.ThreadingTCPServer):
             allow_reuse_address = True
+            # daemon_threads=True ensures the process can exit even if a handler
+            # thread is still blocked on a slow provider. Combined with the
+            # shutdown-requested drain callback (which cancels in-flight tasks)
+            # handlers should finish within the normal socket timeout; this is
+            # the belt-and-braces safety net so we never leave an orphan askd.
+            daemon_threads = True
+            block_on_close = False
 
         if self.request_queue_size is not None:
             try:
@@ -190,6 +199,19 @@ class AskDaemonServer:
                 httpd.active_requests = 0
                 httpd.last_activity = time.time()
                 httpd.activity_lock = threading.Lock()
+                _on_shutdown_requested = self.on_shutdown_requested
+
+                def _trigger_shutdown() -> None:
+                    # Cancel in-flight tasks first so handler threads exit quickly,
+                    # then tell the server to stop accepting new work.
+                    if _on_shutdown_requested is not None:
+                        try:
+                            _on_shutdown_requested()
+                        except Exception:
+                            pass
+                    httpd.shutdown()
+
+                httpd._trigger_shutdown = _trigger_shutdown
                 try:
                     httpd.idle_timeout_s = float(os.environ.get(self.spec.idle_timeout_env, "60") or "60")
                 except Exception:
@@ -217,7 +239,7 @@ class AskDaemonServer:
                                 log_path(self.spec.log_file_name),
                                 f"[INFO] {self.spec.daemon_key} idle timeout ({int(timeout_s)}s) reached; shutting down",
                             )
-                            threading.Thread(target=httpd.shutdown, daemon=True).start()
+                            threading.Thread(target=httpd._trigger_shutdown, daemon=True).start()
                             return
 
                 threading.Thread(target=_idle_monitor, daemon=True).start()

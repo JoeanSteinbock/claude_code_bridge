@@ -5,19 +5,24 @@ from dataclasses import dataclass
 from ccb_protocol import (
     DONE_PREFIX,
     REQ_ID_PREFIX,
+    channel_reply_instruction,
     is_done_text,
     make_req_id,
+    reply_language_instruction,
     strip_done_text,
 )
 
 
-def wrap_opencode_prompt(message: str, req_id: str) -> str:
+def wrap_opencode_prompt(message: str, req_id: str, caller: str = "") -> str:
     message = (message or "").rstrip()
+    channel = channel_reply_instruction(caller)
+    channel_line = f"- {channel}\n" if channel else ""
     return (
         f"{REQ_ID_PREFIX} {req_id}\n\n"
         f"{message}\n\n"
         "IMPORTANT:\n"
-        "- Reply normally, in English.\n"
+        f"- {reply_language_instruction(message)}\n"
+        f"{channel_line}"
         "- End your reply with this exact final line (verbatim, on its own line):\n"
         f"{DONE_PREFIX} {req_id}\n"
     )
