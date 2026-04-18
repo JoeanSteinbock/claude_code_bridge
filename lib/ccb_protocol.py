@@ -113,11 +113,18 @@ def done_line_re(req_id: str) -> re.Pattern[str]:
 
 
 def is_done_text(text: str, req_id: str) -> bool:
-    lines = [ln.rstrip() for ln in (text or "").splitlines()]
-    for i in range(len(lines) - 1, -1, -1):
-        if _is_trailing_noise_line(lines[i]):
-            continue
-        return bool(done_line_re(req_id).match(lines[i]))
+    """True iff `CCB_DONE: <req_id>` appears on its own line anywhere in
+    `text`. Prior versions required the done-line to be the last
+    non-noise line — which meant a single stray trailing word after the
+    marker would silently wedge the ask for its full timeout. Now we
+    match anywhere, since laskd's extract_reply_for_req already handles
+    trailing content after the done marker."""
+    if not text:
+        return False
+    rx = done_line_re(req_id)
+    for line in text.splitlines():
+        if rx.match(line.rstrip()):
+            return True
     return False
 
 

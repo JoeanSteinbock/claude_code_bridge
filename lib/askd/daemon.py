@@ -18,6 +18,9 @@ from askd_runtime import log_path, random_token, state_file_path, write_log
 from ccb_protocol import make_req_id
 from providers import ProviderDaemonSpec, make_qualified_key, parse_qualified_provider
 from worker_pool import BaseSessionWorker, PerSessionWorkerPool
+import subprocess
+import shutil
+import wake_queue
 
 
 ASKD_SPEC = ProviderDaemonSpec(
@@ -123,6 +126,7 @@ class UnifiedAskDaemon:
         # Keyed by id(task) because QueuedTask is an unfrozen dataclass and thus unhashable.
         self._active_tasks: dict = {}
         self._active_tasks_lock = threading.Lock()
+        self._wake_stop = threading.Event()
 
     def _handle_request(self, msg: dict) -> dict:
         """Handle an incoming request."""
@@ -261,6 +265,98 @@ class UnifiedAskDaemon:
             except Exception:
                 pass
 
+    def _wake_scheduler_loop(self) -> None:
+        """Poll the project's wake queue and dispatch due entries.
+
+        Lives in askd (not telegramd) so every project — including
+        terminal-only ones with no Telegram configured — gets wake support.
+        Dispatch is a subprocess spawn of `ask <agent>`; the existing
+        ask → askd → completion-hook chain handles routing based on
+        the entry's `caller` field (terminal / telegram / email).
+        """
+        if not self.work_dir:
+            return
+        project_root = Path(self.work_dir)
+        poll_s = 2.0
+        while not self._wake_stop.is_set():
+            try:
+                due = wake_queue.pop_due(project_root, time.time())
+            except Exception as exc:
+                _write_log(f"[ERROR] wake load error: {exc}")
+                due = []
+            for entry in due:
+                try:
+                    self._fire_wake(project_root, entry)
+                except Exception as exc:
+                    _write_log(
+                        f"[ERROR] wake fire id={entry.get('wake_id')}: {exc}"
+                    )
+            self._wake_stop.wait(poll_s)
+
+    def _fire_wake(self, project_root: Path, entry: dict) -> None:
+        """Dispatch a single due wake by spawning `ask <agent>` async.
+
+        Environment is populated from the entry's caller metadata so the
+        downstream completion-hook routes the reply correctly (pane for
+        terminal, chat_id for telegram, etc.).
+        """
+        agent = str(entry.get("agent") or "").strip().lower()
+        message = str(entry.get("message") or "")
+        caller = str(entry.get("caller") or "terminal").strip().lower()
+        wake_id = str(entry.get("wake_id") or "")
+        if not (agent and message):
+            _write_log(f"[WARN] wake {wake_id} skipped: missing agent/message")
+            return
+
+        env = os.environ.copy()
+        env["CCB_CALLER"] = caller
+        env["CCB_WORK_DIR"] = str(project_root)
+        env["CCB_UNIFIED_ASKD"] = "1"
+        env["CCB_ASKD_AUTOSTART"] = "0"
+        # Strip any pane env the askd process itself inherited — we'll set
+        # explicit routing values from the entry below if applicable.
+        for v in ("TMUX_PANE", "WEZTERM_PANE", "CCB_CALLER_PANE_ID", "CCB_CALLER_TERMINAL"):
+            env.pop(v, None)
+
+        if caller == "telegram":
+            chat_id = str(entry.get("chat_id") or "").strip()
+            if chat_id:
+                env["CCB_TELEGRAM_CHAT_ID"] = chat_id
+        elif caller == "terminal":
+            pane_id = str(entry.get("pane_id") or "").strip()
+            terminal = str(entry.get("terminal") or "tmux").strip()
+            if pane_id:
+                env["CCB_CALLER_PANE_ID"] = pane_id
+                env["CCB_CALLER_TERMINAL"] = terminal
+
+        ask_cmd = shutil.which("ask") or str(
+            Path.home() / ".local" / "share" / "codex-dual" / "bin" / "ask"
+        )
+        if not Path(ask_cmd).is_file():
+            _write_log(f"[ERROR] wake {wake_id}: ask command not found")
+            return
+
+        _write_log(
+            f"[INFO] wake fired id={wake_id} agent={agent} caller={caller}"
+        )
+        # Fire-and-forget in a background thread so the scheduler loop
+        # doesn't block on a slow provider turn.
+        def _run() -> None:
+            try:
+                subprocess.run(
+                    [ask_cmd, agent, "--foreground", "--timeout", "300"],
+                    cwd=str(project_root),
+                    env=env,
+                    input=message,
+                    capture_output=True,
+                    text=True,
+                    timeout=330,
+                )
+            except Exception as exc:
+                _write_log(f"[WARN] wake {wake_id} subprocess: {exc}")
+
+        threading.Thread(target=_run, name=f"wake-{wake_id}", daemon=True).start()
+
     def serve_forever(self) -> int:
         """Start the daemon and serve requests."""
         from askd_server import AskDaemonServer
@@ -268,7 +364,14 @@ class UnifiedAskDaemon:
 
         self.registry.start_all()
 
+        threading.Thread(
+            target=self._wake_scheduler_loop,
+            name="askd-wake-scheduler",
+            daemon=True,
+        ).start()
+
         def _on_stop() -> None:
+            self._wake_stop.set()
             self.registry.stop_all()
             self._cleanup_state_file()
 

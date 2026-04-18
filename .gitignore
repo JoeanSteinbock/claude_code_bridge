@@ -20,6 +20,7 @@ tests/
 .ccb/telegramd.pid
 .ccb/telegramd.log
 .ccb/telegram_downloads/
+.ccb/wake_queue.json
 .codex-session
 .gemini-session
 .claude-session

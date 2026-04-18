@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -233,13 +234,18 @@ class TelegramDaemon:
         d.mkdir(parents=True, exist_ok=True)
         return d
 
-    def _download_attachments(self, msg: dict) -> list[Path]:
+    # File extensions we consider "voice-like" for auto-transcription.
+    _AUDIO_EXTS = {".oga", ".ogg", ".opus", ".mp3", ".m4a", ".wav", ".aac", ".flac"}
+
+    def _download_attachments(self, msg: dict) -> list[tuple[Path, str]]:
         """Download all supported attachments from a Telegram message.
 
-        Returns the list of local file paths (empty if no attachments).
+        Returns a list of (local_path, kind) tuples. `kind` is one of
+        "photo", "document", "voice", "audio", "video", "video_note",
+        "animation" — used downstream to decide whether to transcribe.
         Silently ignores unsupported types (sticker/location/etc.).
         """
-        out: list[Path] = []
+        out: list[tuple[Path, str]] = []
         dest = self._downloads_dir()
 
         # photo: largest variant last
@@ -250,7 +256,10 @@ class TelegramDaemon:
                 file_id = str(biggest.get("file_id") or "")
                 if file_id:
                     mid = int(msg.get("message_id") or 0)
-                    out.append(self.client.download_file(file_id, dest, preferred_name=f"photo-{mid}.jpg"))
+                    out.append((
+                        self.client.download_file(file_id, dest, preferred_name=f"photo-{mid}.jpg"),
+                        "photo",
+                    ))
 
         # document, voice, audio, video, video_note, animation — single file each
         for key in ("document", "voice", "audio", "video", "video_note", "animation"):
@@ -261,9 +270,97 @@ class TelegramDaemon:
             if not file_id:
                 continue
             name = str(media.get("file_name") or "").strip()
-            out.append(self.client.download_file(file_id, dest, preferred_name=name))
+            out.append((
+                self.client.download_file(file_id, dest, preferred_name=name),
+                key,
+            ))
 
         return out
+
+    def _whisper_model_path(self) -> Path | None:
+        """Resolve which GGML model file to use for voice transcription.
+
+        Resolution order: `CCB_WHISPER_MODEL` env, then the default
+        `<install>/models/ggml-small.bin`. Returns None if no model
+        file is present.
+        """
+        env_path = os.environ.get("CCB_WHISPER_MODEL", "").strip()
+        if env_path:
+            p = Path(env_path).expanduser()
+            if p.is_file():
+                return p
+        # Default: prefer `~/.cache/ccb/whisper-models/` (survives
+        # `install.sh` which `rm -rf`s the install prefix). Fall back to
+        # legacy `<codex-dual>/models/` if someone still keeps it there.
+        model_names = ("ggml-medium.bin", "ggml-small.bin", "ggml-base.bin", "ggml-tiny.bin")
+        search_dirs = (
+            Path.home() / ".cache" / "ccb" / "whisper-models",
+            Path.home() / ".local" / "share" / "codex-dual" / "models",
+        )
+        for d in search_dirs:
+            for name in model_names:
+                p = d / name
+                if p.is_file():
+                    return p
+        return None
+
+    def _transcribe_voice(self, src: Path) -> str:
+        """Transcribe an audio file via whisper-cli; return "" on any failure.
+
+        Works on .oga/.ogg/.opus/etc. directly — whisper-cli handles
+        conversion via its bundled ffmpeg reader. Runs with a hard
+        wall-clock timeout so a hung model download can't wedge us.
+        """
+        model = self._whisper_model_path()
+        if not model:
+            return ""
+        whisper_bin = shutil.which("whisper-cli") or "/opt/homebrew/bin/whisper-cli"
+        if not Path(whisper_bin).is_file():
+            return ""
+        # whisper-cli needs 16kHz mono WAV for best results; let ffmpeg
+        # convert first so we don't depend on whisper's built-in decoder
+        # (which varies by build).
+        ffmpeg = shutil.which("ffmpeg")
+        wav_path = src.with_suffix(".wav")
+        try:
+            if ffmpeg:
+                subprocess.run(
+                    [ffmpeg, "-y", "-i", str(src), "-ar", "16000", "-ac", "1", str(wav_path)],
+                    check=True, capture_output=True, timeout=60,
+                )
+                input_path = wav_path
+            else:
+                input_path = src
+            result = subprocess.run(
+                [whisper_bin, "-m", str(model), "-f", str(input_path),
+                 "-l", "auto", "-nt", "-np", "--output-txt", "-of", str(input_path)],
+                capture_output=True, text=True, timeout=180,
+            )
+            if result.returncode != 0:
+                _write_log(
+                    f"[telegramd] whisper-cli exit={result.returncode}: {result.stderr.strip()[:200]}",
+                    self.project_root,
+                )
+                return ""
+            # whisper-cli with -of writes <input_path>.txt
+            txt_path = Path(f"{input_path}.txt")
+            if txt_path.exists():
+                return txt_path.read_text(encoding="utf-8", errors="replace").strip()
+            # Fallback: parse stdout.
+            return result.stdout.strip()
+        except subprocess.TimeoutExpired:
+            _write_log(f"[telegramd] whisper-cli timed out on {src.name}", self.project_root)
+            return ""
+        except Exception as exc:
+            _write_log(f"[telegramd] whisper-cli error on {src.name}: {exc}", self.project_root)
+            return ""
+        finally:
+            # Best-effort cleanup of intermediate wav; leave transcript .txt.
+            try:
+                if ffmpeg and wav_path.exists():
+                    wav_path.unlink()
+            except Exception:
+                pass
 
     def _handle_update(self, update: dict) -> None:
         update_id = int(update.get("update_id", 0) or 0)
@@ -292,10 +389,12 @@ class TelegramDaemon:
         # Text, or caption that accompanies a media attachment.
         text = str(msg.get("text", "") or msg.get("caption", "") or "").strip()
 
-        # Detect and download any attachments. If present, we append a
-        # machine-parseable "[attachment]" line per file to the message so the
-        # provider can open it with its own file-reading tool.
-        attachments: list[Path] = []
+        # Detect and download any attachments. Voice/audio get transcribed
+        # via whisper-cli so the provider sees the actual spoken text.
+        # Other files (photos, documents, video) are surfaced as
+        # `[attachment] <path>` lines so the provider can open them with
+        # its own tools.
+        attachments: list[tuple[Path, str]] = []
         try:
             attachments = self._download_attachments(msg)
         except Exception as exc:
@@ -304,7 +403,21 @@ class TelegramDaemon:
             return
 
         if attachments:
-            atts = "\n".join(f"[attachment] {p}" for p in attachments)
+            att_lines: list[str] = []
+            for path, kind in attachments:
+                is_voice_kind = kind in {"voice", "audio", "video_note"}
+                is_audio_ext = path.suffix.lower() in self._AUDIO_EXTS
+                if is_voice_kind or is_audio_ext:
+                    transcript = self._transcribe_voice(path)
+                    if transcript:
+                        att_lines.append(f"[voice transcript] {transcript}")
+                        _write_log(
+                            f"[telegramd] transcribed {path.name}: {transcript[:60]!r}",
+                            self.project_root,
+                        )
+                        continue
+                att_lines.append(f"[attachment] {path}")
+            atts = "\n".join(att_lines)
             text = f"{text}\n\n{atts}".strip() if text else atts
 
         if not text:
@@ -471,15 +584,27 @@ class TelegramDaemon:
         except Exception:
             pass
 
+        # Cap per-Telegram-message timeout regardless of config: a stuck
+        # ask (provider drift-off-format, pane hang, etc.) should fail fast
+        # so the bot's chat worker doesn't head-of-line-block for an hour.
+        # Override via `CCB_TELEGRAM_ASK_TIMEOUT_S` env if a specific bot
+        # really needs longer-running tasks.
+        default_cap = 300
+        try:
+            cap = int(os.environ.get("CCB_TELEGRAM_ASK_TIMEOUT_S", "") or default_cap)
+        except Exception:
+            cap = default_cap
+        ask_timeout_s = min(self.config.request_timeout_seconds, cap)
+
         try:
             result = subprocess.run(
-                [ask_cmd, provider, "--foreground", "--timeout", str(self.config.request_timeout_seconds)],
+                [ask_cmd, provider, "--foreground", "--timeout", str(ask_timeout_s)],
                 cwd=work_dir,
                 env=env,
                 input=message,
                 capture_output=True,
                 text=True,
-                timeout=self.config.request_timeout_seconds + 30,
+                timeout=ask_timeout_s + 30,
             )
         except subprocess.TimeoutExpired:
             _stop_typing()

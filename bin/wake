@@ -1,0 +1,211 @@
+#!/usr/bin/env python3
+"""
+wake — schedule a future agent turn (project-scoped).
+
+Usage:
+    wake <agent> --in <duration> [--caller telegram --chat-id <ID>] "<message>"
+    wake list
+    wake cancel <wake_id>
+
+<duration> is a combination of `<n>s | <n>m | <n>h`, e.g. `30s`, `5m`,
+`1h30m`. Agent must be one of the supported provider names (claude,
+codex, gemini, opencode, droid, ...).
+
+The wake fires asynchronously. When due, telegramd (for
+caller=telegram) dispatches the stored message as if the user had just
+sent it — the reply flows back through the normal channel.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+import time
+from pathlib import Path
+
+# Make sibling `lib/` importable when invoked directly.
+_HERE = Path(__file__).resolve().parent
+_LIB = _HERE.parent / "lib"
+if _LIB.is_dir() and str(_LIB) not in sys.path:
+    sys.path.insert(0, str(_LIB))
+
+import wake_queue  # noqa: E402
+from ccb_protocol import make_req_id  # noqa: E402
+
+SUPPORTED_AGENTS = {
+    "claude", "codex", "gemini", "opencode", "droid",
+    "copilot", "codebuddy", "qwen",
+}
+
+_DUR_RE = re.compile(r"(\d+)([smh])", re.IGNORECASE)
+
+
+def parse_duration(s: str) -> int:
+    total = 0
+    matched_any = False
+    for m in _DUR_RE.finditer((s or "").strip().lower()):
+        matched_any = True
+        n = int(m.group(1))
+        u = m.group(2)
+        total += n * {"s": 1, "m": 60, "h": 3600}[u]
+    if not matched_any or total <= 0:
+        raise ValueError(f"invalid duration: {s!r} (expected e.g. '30s', '5m', '1h30m')")
+    return total
+
+
+def resolve_project_root() -> Path:
+    wd = os.environ.get("CCB_WORK_DIR", "").strip()
+    if wd:
+        return Path(wd)
+    return Path.cwd()
+
+
+def _resolve_caller(explicit: str) -> str:
+    """Pick the right caller when the user didn't pass --caller.
+
+    Prefer telegram when the project / env carries a chat_id (so replies
+    land back in the same Telegram thread). Otherwise default to
+    terminal so the wake still fires in tmux-only projects.
+    """
+    explicit = (explicit or "").strip().lower()
+    if explicit:
+        return explicit
+    if os.environ.get("CCB_TELEGRAM_CHAT_ID", "").strip():
+        return "telegram"
+    cfg_path = resolve_project_root() / ".ccb" / "ccb.config"
+    if cfg_path.is_file():
+        try:
+            cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+            allowed = (cfg.get("telegram") or {}).get("allowed_chat_ids") or []
+            if allowed:
+                return "telegram"
+        except Exception:
+            pass
+    return "terminal"
+
+
+def cmd_add(args: argparse.Namespace) -> int:
+    agent = args.agent.lower().strip()
+    if agent not in SUPPORTED_AGENTS:
+        print(f"wake: unknown agent {agent!r}. One of: {sorted(SUPPORTED_AGENTS)}", file=sys.stderr)
+        return 2
+
+    try:
+        seconds = parse_duration(args.in_)
+    except ValueError as exc:
+        print(f"wake: {exc}", file=sys.stderr)
+        return 2
+
+    message = (args.message or "").strip()
+    if not message:
+        print("wake: message is required", file=sys.stderr)
+        return 2
+
+    caller = _resolve_caller(args.caller)
+    project_root = resolve_project_root()
+
+    entry: dict = {
+        "wake_id": make_req_id(),
+        "agent": agent,
+        "message": message,
+        "fire_at": time.time() + seconds,
+        "created_at": time.time(),
+        "caller": caller,
+    }
+
+    if caller == "telegram":
+        chat_id = (args.chat_id or "").strip() or os.environ.get("CCB_TELEGRAM_CHAT_ID", "").strip()
+        if not chat_id:
+            cfg_path = project_root / ".ccb" / "ccb.config"
+            if cfg_path.is_file():
+                try:
+                    cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+                    allowed = (cfg.get("telegram") or {}).get("allowed_chat_ids") or []
+                    if allowed:
+                        chat_id = str(allowed[0]).strip()
+                except Exception:
+                    pass
+        if not chat_id:
+            print("wake: --chat-id is required for caller=telegram "
+                  "(or set CCB_TELEGRAM_CHAT_ID, or list allowed_chat_ids in ccb.config)",
+                  file=sys.stderr)
+            return 2
+        entry["chat_id"] = chat_id
+    elif caller == "terminal":
+        # Capture caller's pane so the completion hook routes the reply
+        # back to this shell, not a default fallback.
+        pane_id = os.environ.get("TMUX_PANE", "").strip() or os.environ.get("WEZTERM_PANE", "").strip()
+        terminal = "wezterm" if os.environ.get("WEZTERM_PANE") else "tmux"
+        if pane_id:
+            entry["pane_id"] = pane_id
+            entry["terminal"] = terminal
+
+    wake_queue.enqueue(project_root, entry)
+    print(entry["wake_id"])
+    return 0
+
+
+def cmd_list(args: argparse.Namespace) -> int:
+    project_root = resolve_project_root()
+    q = wake_queue.load(project_root)
+    if not q:
+        return 0
+    now = time.time()
+    for e in sorted(q, key=lambda x: float(x.get("fire_at") or 0)):
+        fires_in = float(e.get("fire_at", 0)) - now
+        when = f"{int(fires_in)}s" if fires_in >= 0 else "overdue"
+        print(f"{e.get('wake_id')}\t{e.get('agent')}\t{when}\t{e.get('caller','')}"
+              f"\t{e.get('chat_id','')}\t{e.get('message','')[:80]}")
+    return 0
+
+
+def cmd_cancel(args: argparse.Namespace) -> int:
+    project_root = resolve_project_root()
+    ok = wake_queue.cancel(project_root, args.wake_id)
+    if not ok:
+        print(f"wake: no pending entry with id {args.wake_id!r}", file=sys.stderr)
+        return 1
+    print("cancelled")
+    return 0
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="wake", description=__doc__.split("\n", 1)[0])
+    sub = p.add_subparsers(dest="cmd")
+    # Default (add) form is handled via dispatch below; we still register
+    # a subparser for completeness.
+    add_p = sub.add_parser("add")
+    add_p.add_argument("agent")
+    add_p.add_argument("--in", dest="in_", required=True, metavar="DUR")
+    add_p.add_argument("--caller", default="", help="terminal | telegram (auto-detected if omitted)")
+    add_p.add_argument("--chat-id", dest="chat_id", default="")
+    add_p.add_argument("message")
+    add_p.set_defaults(func=cmd_add)
+
+    list_p = sub.add_parser("list")
+    list_p.set_defaults(func=cmd_list)
+
+    cancel_p = sub.add_parser("cancel")
+    cancel_p.add_argument("wake_id")
+    cancel_p.set_defaults(func=cmd_cancel)
+
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = list(argv if argv is not None else sys.argv[1:])
+    # Allow `wake <agent> --in ... "msg"` as shorthand for `wake add ...`.
+    if argv and argv[0] not in {"add", "list", "cancel", "-h", "--help"}:
+        argv = ["add", *argv]
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    if not getattr(args, "func", None):
+        parser.print_help(sys.stderr)
+        return 2
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

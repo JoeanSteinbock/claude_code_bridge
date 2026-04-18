@@ -131,6 +131,7 @@ SCRIPTS_TO_LINK=(
   bin/ccb-completion-hook
   bin/maild
   bin/ctx-transfer
+  bin/wake
   ccb
 )
 
@@ -1175,6 +1176,7 @@ install_settings_permissions() {
     'Bash(ask *)'
     'Bash(ccb-ping *)'
     'Bash(pend *)'
+    'Bash(wake *)'
   )
 
   if [[ ! -f "$settings_file" ]]; then
@@ -1184,7 +1186,8 @@ install_settings_permissions() {
 	    "allow": [
 	      "Bash(ask *)",
 	      "Bash(ccb-ping *)",
-	      "Bash(pend *)"
+	      "Bash(pend *)",
+	      "Bash(wake *)"
 	    ],
     "deny": []
   }
