@@ -29,6 +29,38 @@ class TelegramBotClient:
     def get_me(self) -> dict[str, Any]:
         return self._call("getMe")
 
+    def set_my_commands(self, commands: list[dict[str, str]]) -> dict[str, Any]:
+        """Register the bot's `/` autocomplete menu (Telegram Bot API).
+
+        `commands` is a list of `{"command": "new", "description": "..."}`
+        dicts. Command names must match `[a-z0-9_]{1,32}`.
+        """
+        return self._call("setMyCommands", {"commands": list(commands)})
+
+    def set_message_reaction(
+        self,
+        chat_id: str | int,
+        message_id: int,
+        emoji: str,
+        *,
+        is_big: bool = False,
+    ) -> dict[str, Any]:
+        """Attach an emoji reaction to a specific message.
+
+        Telegram only accepts a curated set of reaction emojis for non-Premium
+        bots (👍 👎 ❤️ 🔥 👏 😁 🤔 😱 🎉 🤯 😢 🙏 🤝 🤗 💯 etc.). The call will
+        error out with 400 if the emoji is unsupported.
+        """
+        return self._call(
+            "setMessageReaction",
+            {
+                "chat_id": str(chat_id),
+                "message_id": int(message_id),
+                "reaction": [{"type": "emoji", "emoji": emoji}],
+                "is_big": bool(is_big),
+            },
+        )
+
     def get_updates(self, *, offset: int | None = None, timeout: int = 30) -> list[dict[str, Any]]:
         payload: dict[str, Any] = {"timeout": int(timeout)}
         if offset is not None:

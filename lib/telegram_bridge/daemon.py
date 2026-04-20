@@ -38,6 +38,21 @@ SESSION_FILES = {
 _PROVIDER_PREFIX_RE = re.compile(r"^\[([A-Za-z][A-Za-z0-9_-]*)\]")
 
 
+def _looks_like_single_emoji(text: str) -> bool:
+    """True iff `text` is plausibly just one emoji (single-codepoint or
+    multi-codepoint with ZWJ / variation selectors). Used to decide
+    whether to deliver a bot reply as a Telegram reaction instead of a
+    regular text message."""
+    s = (text or "").strip()
+    if not s or len(s) > 10:
+        return False
+    # Any ASCII letter / digit / common punctuation → not a bare emoji.
+    for ch in s:
+        if ch.isascii() and (ch.isalnum() or ch in "!?.,:;'\"()[]{}<>@#$%^&*_+-=\\|/"):
+            return False
+    return True
+
+
 def _provider_from_replied_to(reply_to_message: dict | None) -> str | None:
     """If the user replied to one of our `[Provider]` messages, return that provider."""
     if not isinstance(reply_to_message, dict):
@@ -201,6 +216,23 @@ class TelegramDaemon:
 
         signal.signal(signal.SIGTERM, self._handle_signal)
         signal.signal(signal.SIGINT, self._handle_signal)
+
+        # Register the `/` autocomplete menu so users get command
+        # suggestions in Telegram clients. Best-effort: don't block
+        # startup if the network call fails.
+        try:
+            self.client.set_my_commands([
+                {"command": "new", "description": "reset a provider (e.g. /new codex)"},
+                {"command": "reset", "description": "alias for /new"},
+                {"command": "restart", "description": "alias for /new"},
+                {"command": "clear", "description": "alias for /new"},
+                {"command": "respawn", "description": "full restart of a provider's CLI"},
+                {"command": "relaunch", "description": "alias for /respawn"},
+                {"command": "providers", "description": "list available providers"},
+                {"command": "help", "description": "show usage"},
+            ])
+        except Exception as exc:
+            _write_log(f"[telegramd] setMyCommands failed: {exc}", self.project_root)
 
         _write_log(f"[telegramd] started pid={self.state.pid} bot=@{username or 'unknown'}", self.project_root)
         while not self.stop_event.is_set():
@@ -393,14 +425,18 @@ class TelegramDaemon:
         # via whisper-cli so the provider sees the actual spoken text.
         # Other files (photos, documents, video) are surfaced as
         # `[attachment] <path>` lines so the provider can open them with
-        # its own tools.
+        # its own tools. On download failure, we still proceed and
+        # annotate the prompt so the bot at least knows the user tried
+        # to send something (caption/context isn't lost just because the
+        # binary fetch hiccuped).
         attachments: list[tuple[Path, str]] = []
+        attachment_error = ""
         try:
             attachments = self._download_attachments(msg)
         except Exception as exc:
+            attachment_error = str(exc)
             _write_log(f"[telegramd] attachment error chat={chat_id}: {exc}", self.project_root)
             self._send_text(chat_id, f"⚠️ couldn't fetch attachment: {exc}", reply_to_message_id=reply_to)
-            return
 
         if attachments:
             att_lines: list[str] = []
@@ -420,6 +456,13 @@ class TelegramDaemon:
             atts = "\n".join(att_lines)
             text = f"{text}\n\n{atts}".strip() if text else atts
 
+        if attachment_error:
+            # Download failed upstream. Tell the bot the user tried to
+            # send something, but don't drop the caption/accompanying
+            # text if there was any.
+            note = f"[attachment-failed] user tried to send an attachment but download failed: {attachment_error}"
+            text = f"{text}\n\n{note}".strip() if text else note
+
         if not text:
             return
 
@@ -431,17 +474,62 @@ class TelegramDaemon:
             providers = ", ".join(SUPPORTED_PROVIDERS)
             self._send_text(chat_id, f"Providers: {providers}", reply_to_message_id=reply_to)
             return
+        if parsed.command in ("new", "new_all"):
+            self._run_new_command(parsed, chat_id, reply_to)
+            return
+        if parsed.command == "new_usage":
+            available = ", ".join(self._available_providers()) or "(none mounted)"
+            self._send_text(
+                chat_id,
+                f"Usage: /new <provider> (or `all`).\nMounted: {available}",
+                reply_to_message_id=reply_to,
+            )
+            return
+        if parsed.command in ("respawn", "respawn_all"):
+            self._run_respawn_command(parsed, chat_id, reply_to)
+            return
+        if parsed.command == "respawn_usage":
+            available = ", ".join(self._available_providers()) or "(none mounted)"
+            self._send_text(
+                chat_id,
+                f"Usage: /respawn <provider> (or `all`). Full CLI restart.\nMounted: {available}",
+                reply_to_message_id=reply_to,
+            )
+            return
         if not parsed.message:
             self._send_text(chat_id, "Empty message.", reply_to_message_id=reply_to)
             return
 
-        if parsed.broadcast:
-            providers = list(self.config.broadcast_providers)
+        if parsed.targets:
+            # Multi-mention: "@claude ... @codex ..." — deliver the full
+            # message to each mentioned provider. They see each other's
+            # mentions so they can reason about who else is addressed.
+            providers = list(parsed.targets)
+            # Silently skip mentioned providers that aren't mounted in
+            # this project — user shouldn't get N error messages just
+            # because they addressed a model that isn't running.
+            mounted_set = set(self._available_providers())
+            providers = [p for p in providers if p in mounted_set]
+        elif parsed.broadcast:
+            # Filter out unmounted providers for the same reason.
+            mounted_set = set(self._available_providers())
+            providers = [p for p in self.config.broadcast_providers if p in mounted_set]
         else:
             # Precedence: explicit prefix > reply_to target > default_provider.
             inferred = _provider_from_replied_to(msg.get("reply_to_message"))
             chosen = parsed.provider or inferred or self.config.default_provider
             providers = [chosen]
+
+        if not providers:
+            # Broadcast / multi-mention landed on zero mounted targets.
+            # Tell the user once instead of going silent.
+            available = ", ".join(self._available_providers()) or "(none)"
+            self._send_text(
+                chat_id,
+                f"No mounted providers matched. Available: {available}",
+                reply_to_message_id=reply_to,
+            )
+            return
         for provider in providers:
             self._enqueue_message(
                 provider=provider,
@@ -501,6 +589,11 @@ class TelegramDaemon:
         # In group chats we anchor the reply at the first queued message so users
         # can trace which burst triggered the reply. In DMs we send plain.
         anchor_id = int(batch[0].get("message_id") or 0) if is_group else 0
+        # Track the original message id even in DMs so short emoji replies
+        # can be delivered as reactions on that message (only meaningful
+        # for single-message batches; a coalesced batch of >1 doesn't have
+        # one natural "target" message).
+        source_message_id = int(batch[0].get("message_id") or 0) if len(batch) == 1 else 0
         if len(batch) == 1:
             combined = str(batch[0].get("message") or "")
         else:
@@ -512,9 +605,9 @@ class TelegramDaemon:
             for i, item in enumerate(batch, 1):
                 lines.append(f"{i}. {item.get('message') or ''}")
             combined = "\n".join(lines)
-        self._run_request(provider, combined, chat_id, anchor_id)
+        self._run_request(provider, combined, chat_id, anchor_id, source_message_id=source_message_id)
 
-    def _run_request(self, provider: str, message: str, chat_id: str, reply_to_message_id: int) -> None:
+    def _run_request(self, provider: str, message: str, chat_id: str, reply_to_message_id: int, *, source_message_id: int = 0) -> None:
         mounted = self._available_providers()
         if not mounted:
             self._send_text(
@@ -625,6 +718,19 @@ class TelegramDaemon:
         # already extracted the assistant's text. Delivering that text is more
         # useful to the user than a bare "ask exited with code 2" error.
         if reply:
+            # If the reply is essentially just an emoji, try to attach it
+            # as a Telegram reaction on the source message instead of
+            # sending a whole new message. Falls back to text on any
+            # failure (e.g. emoji not in Telegram's allowed set).
+            if source_message_id and _looks_like_single_emoji(reply):
+                try:
+                    self.client.set_message_reaction(chat_id, source_message_id, reply)
+                    return
+                except Exception as exc:
+                    _write_log(
+                        f"[telegramd] reaction fallback → text (chat={chat_id}, emoji={reply!r}): {exc}",
+                        self.project_root,
+                    )
             self._send_text(chat_id, f"[{provider.capitalize()}]\n{reply}", reply_to_message_id=reply_to_message_id)
             return
         if result.returncode != 0:
@@ -681,6 +787,149 @@ class TelegramDaemon:
             if path.exists():
                 return str(path)
         return None
+
+    def _find_autonew_command(self) -> str | None:
+        project_root = Path(__file__).resolve().parents[2]
+        candidates = [
+            project_root / "bin" / "autonew",
+            Path.home() / ".local" / "bin" / "autonew",
+            Path.home() / ".local" / "share" / "codex-dual" / "bin" / "autonew",
+        ]
+        for path in candidates:
+            if path.exists():
+                return str(path)
+        return None
+
+    def _run_new_command(self, parsed, chat_id: str, reply_to_message_id: int) -> None:
+        """Handle `/new <provider>` and `/new all` — reset provider sessions.
+
+        Runs `autonew <provider>` directly (no AI round-trip). Results are
+        delivered as a short Telegram reply.
+        """
+        autonew_cmd = self._find_autonew_command()
+        if not autonew_cmd:
+            self._send_text(chat_id, "autonew command not found on this host.",
+                            reply_to_message_id=reply_to_message_id)
+            return
+
+        if parsed.command == "new_all":
+            targets = list(self._available_providers())
+            if not targets:
+                self._send_text(chat_id, "No providers are mounted for this project.",
+                                reply_to_message_id=reply_to_message_id)
+                return
+        else:
+            target = (parsed.provider or "").strip().lower()
+            if not target or target not in SUPPORTED_PROVIDERS:
+                rest = (parsed.message or "").strip() or "(empty)"
+                self._send_text(
+                    chat_id,
+                    f"Unknown provider for /new: {rest!r}. Try one of: "
+                    f"{', '.join(SUPPORTED_PROVIDERS)} or 'all'.",
+                    reply_to_message_id=reply_to_message_id,
+                )
+                return
+            targets = [target]
+
+        work_dir = self._work_dir()
+        env = os.environ.copy()
+        env["CCB_WORK_DIR"] = work_dir
+        # Don't let inherited pane vars confuse autonew's pane resolver.
+        for v in ("TMUX_PANE", "WEZTERM_PANE", "CCB_CALLER_PANE_ID", "CCB_CALLER_TERMINAL"):
+            env.pop(v, None)
+
+        results: list[str] = []
+        for target in targets:
+            try:
+                rc = subprocess.run(
+                    [autonew_cmd, target],
+                    cwd=work_dir,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                )
+                if rc.returncode == 0:
+                    results.append(f"✓ {target}")
+                else:
+                    msg = (rc.stderr or rc.stdout or "").strip().splitlines()
+                    tail = msg[-1] if msg else f"exit {rc.returncode}"
+                    results.append(f"✗ {target}: {tail[:120]}")
+            except subprocess.TimeoutExpired:
+                results.append(f"✗ {target}: timed out")
+            except Exception as exc:
+                results.append(f"✗ {target}: {exc}")
+
+        self._send_text(chat_id, "Reset:\n" + "\n".join(results),
+                        reply_to_message_id=reply_to_message_id)
+
+    def _run_respawn_command(self, parsed, chat_id: str, reply_to_message_id: int) -> None:
+        """Kill + relaunch a provider's CLI in its tmux/wezterm pane.
+
+        Full process restart (new PID), not just a `/new` inside the CLI.
+        Reads pane_id + start_cmd from the provider's session file and
+        calls the terminal backend's `respawn_pane`.
+        """
+        if parsed.command == "respawn_all":
+            targets = list(self._available_providers())
+            if not targets:
+                self._send_text(chat_id, "No providers are mounted for this project.",
+                                reply_to_message_id=reply_to_message_id)
+                return
+        else:
+            target = (parsed.provider or "").strip().lower()
+            if not target or target not in SUPPORTED_PROVIDERS:
+                rest = (parsed.message or "").strip() or "(empty)"
+                self._send_text(
+                    chat_id,
+                    f"Unknown provider for /respawn: {rest!r}. Try one of: "
+                    f"{', '.join(SUPPORTED_PROVIDERS)} or 'all'.",
+                    reply_to_message_id=reply_to_message_id,
+                )
+                return
+            targets = [target]
+
+        work_dir = self._work_dir()
+        # Import lazily to avoid pulling terminal backends on startup.
+        try:
+            from terminal import get_backend_for_session
+        except Exception as exc:
+            self._send_text(chat_id, f"Could not load terminal backend: {exc}",
+                            reply_to_message_id=reply_to_message_id)
+            return
+
+        results: list[str] = []
+        for target in targets:
+            session_name = SESSION_FILES.get(target)
+            if not session_name:
+                results.append(f"✗ {target}: no session file mapping")
+                continue
+            session_file = find_project_session_file(self.project_root, session_name)
+            if not session_file or not session_file.exists():
+                results.append(f"✗ {target}: no active session")
+                continue
+            try:
+                data = json.loads(session_file.read_text(encoding="utf-8-sig"))
+            except Exception as exc:
+                results.append(f"✗ {target}: unreadable session ({exc})")
+                continue
+            pane_id = str(data.get("pane_id") or "").strip()
+            start_cmd = str(data.get("start_cmd") or "").strip()
+            if not (pane_id and start_cmd):
+                results.append(f"✗ {target}: missing pane_id or start_cmd")
+                continue
+            try:
+                backend = get_backend_for_session(data)
+                if not backend or not hasattr(backend, "respawn_pane"):
+                    results.append(f"✗ {target}: backend lacks respawn_pane")
+                    continue
+                backend.respawn_pane(pane_id, cmd=start_cmd, cwd=work_dir, remain_on_exit=True)
+                results.append(f"✓ {target} (pane {pane_id})")
+            except Exception as exc:
+                results.append(f"✗ {target}: {exc}")
+
+        self._send_text(chat_id, "Respawn:\n" + "\n".join(results),
+                        reply_to_message_id=reply_to_message_id)
 
 
 def start_daemon(foreground: bool = False, work_dir: str | Path | None = None) -> None:
