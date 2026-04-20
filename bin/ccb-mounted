@@ -65,11 +65,13 @@ if [[ "$OSTYPE" == "msys" ]] || [[ "$OSTYPE" == "cygwin" ]] || [[ -n "${WINDIR:-
     fi
   done
 else
-  # Linux/macOS: use pgrep
+  # Linux/macOS: grep full cmdline from `ps -eo command`.
   # Match both legacy per-provider daemons (caskd/gaskd/laskd/oaskd/daskd)
-  # and the unified askd daemon which serves all providers.
-  # Use `-lf` (portable on BSD/macOS + Linux procps) — BSD pgrep has no `-a`.
-  ONLINE=$(pgrep -lf "bin/[cglod]?askd$" 2>/dev/null | grep -oE "[cglod]?askd" | sort -u || true)
+  # and the unified askd daemon. We used to use `pgrep -lf`, but on Linux
+  # scripts launched via `#!/usr/bin/env python3` show the interpreter
+  # name in `-l` output and the actual askd path is lost — which made the
+  # detection silently return nothing even when askd was running.
+  ONLINE=$(ps -eo command= 2>/dev/null | grep -oE "bin/[cglod]?askd" | sed 's|bin/||' | sort -u || true)
 
   # If the unified askd is running, every provider with a session file is mounted.
   UNIFIED_ONLINE=false

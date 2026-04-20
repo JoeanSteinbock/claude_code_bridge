@@ -129,6 +129,7 @@ SCRIPTS_TO_LINK=(
   bin/pend
   bin/autonew
   bin/ccb-completion-hook
+  bin/ccb-mounted
   bin/maild
   bin/ctx-transfer
   bin/wake
