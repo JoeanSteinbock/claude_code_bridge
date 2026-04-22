@@ -614,6 +614,12 @@ class AILauncher:
         prov = (provider or "").strip().lower()
         if prov in {"claude", "codex", "gemini", "opencode", "droid", "email", "manual"}:
             env["CCB_CALLER"] = prov
+        # Many provider CLIs use `update-notifier` (npm pkg) which can pop a
+        # "new version available — update?" prompt on startup. That prompt
+        # blocks tmux-driven unattended restarts the same way Claude's
+        # resume prompt does. Suppressing it globally for provider panes:
+        if prov in {"codex", "opencode", "gemini", "droid"}:
+            env.setdefault("NO_UPDATE_NOTIFIER", "1")
         # Merge per-provider launch_env from config.
         extra = self.launch_env.get(prov)
         if isinstance(extra, dict):
