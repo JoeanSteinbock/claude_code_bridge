@@ -3224,9 +3224,17 @@ class AILauncher:
         has_history = False
         resume_dir = None
         if self.resume:
-            _, has_history, resume_dir = self._get_latest_claude_session_id()
+            session_id, has_history, resume_dir = self._get_latest_claude_session_id()
             if has_history:
-                cmd.append("--continue")
+                # Prefer `--resume <id>` over bare `--continue`. `--continue`
+                # can pop an interactive "resume full or with summary?" prompt
+                # when the previous process was killed mid-turn — which
+                # blocks the tmux-driven restart path with no one around to
+                # answer it. Targeting a specific session id sidesteps that.
+                if session_id:
+                    cmd.extend(["--resume", session_id])
+                else:
+                    cmd.append("--continue")
         # Append per-provider launch_args from config.
         extra = self.launch_args.get("claude")
         if isinstance(extra, str) and extra.strip():
