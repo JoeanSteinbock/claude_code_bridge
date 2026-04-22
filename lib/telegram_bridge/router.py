@@ -91,12 +91,20 @@ def parse_message(text: str, default_provider: str) -> ParsedTelegramText:
                 return ParsedTelegramText(provider=target, message="", command="respawn")
             return ParsedTelegramText(provider=None, message=rest, command="respawn")
 
-    # /context, /compact — Claude Code slash commands. Typed directly into
-    # the provider pane (bypassing the ask/CCB_DONE protocol) because these
-    # commands don't follow our reply convention. Default target is claude;
-    # `/compact gemini` etc. can retarget.
-    for stem in ("/context", "/compact"):
-        cname = stem[1:]  # "context" or "compact"
+    # Provider-native slash commands — typed directly into the provider
+    # pane (bypassing the ask/CCB_DONE protocol) because these commands
+    # don't follow our reply convention. `/stats` is an alias for
+    # `/status`. Default target is claude; `/compact gemini` etc. can
+    # retarget.
+    #
+    # stem → canonical command name sent to the pane
+    PASSTHROUGHS = {
+        "/context": "context",
+        "/compact": "compact",
+        "/status": "status",
+        "/stats": "status",
+    }
+    for stem, cname in PASSTHROUGHS.items():
         if lowered == stem:
             return ParsedTelegramText(provider="claude", message="", command=cname)
         if lowered.startswith(stem + " "):

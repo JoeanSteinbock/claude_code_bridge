@@ -230,6 +230,8 @@ class TelegramDaemon:
                 {"command": "relaunch", "description": "alias for /respawn"},
                 {"command": "context", "description": "show Claude's context window usage"},
                 {"command": "compact", "description": "compact Claude's conversation context"},
+                {"command": "status", "description": "show Claude's session status"},
+                {"command": "stats", "description": "alias for /status"},
                 {"command": "providers", "description": "list available providers"},
                 {"command": "help", "description": "show usage"},
             ])
@@ -498,7 +500,7 @@ class TelegramDaemon:
                 reply_to_message_id=reply_to,
             )
             return
-        if parsed.command in ("context", "compact"):
+        if parsed.command in ("context", "compact", "status"):
             self._run_slash_passthrough(parsed.command, parsed.provider or "claude",
                                         chat_id, reply_to)
             return
