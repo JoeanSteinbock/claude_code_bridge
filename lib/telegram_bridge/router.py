@@ -91,6 +91,21 @@ def parse_message(text: str, default_provider: str) -> ParsedTelegramText:
                 return ParsedTelegramText(provider=target, message="", command="respawn")
             return ParsedTelegramText(provider=None, message=rest, command="respawn")
 
+    # /context, /compact — Claude Code slash commands. Typed directly into
+    # the provider pane (bypassing the ask/CCB_DONE protocol) because these
+    # commands don't follow our reply convention. Default target is claude;
+    # `/compact gemini` etc. can retarget.
+    for stem in ("/context", "/compact"):
+        cname = stem[1:]  # "context" or "compact"
+        if lowered == stem:
+            return ParsedTelegramText(provider="claude", message="", command=cname)
+        if lowered.startswith(stem + " "):
+            rest = raw[len(stem) + 1:].strip().lower()
+            target = _normalize_provider(rest) if rest else ""
+            if target and target != "all":
+                return ParsedTelegramText(provider=target, message="", command=cname)
+            return ParsedTelegramText(provider="claude", message="", command=cname)
+
     if lowered.startswith("/ask "):
         parts = raw.split(None, 2)
         if len(parts) >= 3:

@@ -228,6 +228,8 @@ class TelegramDaemon:
                 {"command": "clear", "description": "alias for /new"},
                 {"command": "respawn", "description": "full restart of a provider's CLI"},
                 {"command": "relaunch", "description": "alias for /respawn"},
+                {"command": "context", "description": "show Claude's context window usage"},
+                {"command": "compact", "description": "compact Claude's conversation context"},
                 {"command": "providers", "description": "list available providers"},
                 {"command": "help", "description": "show usage"},
             ])
@@ -495,6 +497,10 @@ class TelegramDaemon:
                 f"Usage: /respawn <provider> (or `all`). Full CLI restart.\nMounted: {available}",
                 reply_to_message_id=reply_to,
             )
+            return
+        if parsed.command in ("context", "compact"):
+            self._run_slash_passthrough(parsed.command, parsed.provider or "claude",
+                                        chat_id, reply_to)
             return
         if not parsed.message:
             self._send_text(chat_id, "Empty message.", reply_to_message_id=reply_to)
@@ -930,6 +936,106 @@ class TelegramDaemon:
 
         self._send_text(chat_id, "Respawn:\n" + "\n".join(results),
                         reply_to_message_id=reply_to_message_id)
+
+    def _run_slash_passthrough(
+        self,
+        command: str,
+        provider: str,
+        chat_id: str,
+        reply_to_message_id: int,
+    ) -> None:
+        """Type a provider-native slash command (`/context`, `/compact`) into
+        the pane and return the output tail.
+
+        Bypasses the ask/CCB_DONE protocol because these commands don't
+        follow our reply convention — they produce UI output inside the
+        provider's CLI. We snapshot the pane before sending, wait a few
+        seconds, capture the post-send tail, and post the diff.
+        """
+        provider = (provider or "claude").strip().lower()
+        if provider not in SUPPORTED_PROVIDERS:
+            self._send_text(chat_id, f"Unknown provider: {provider}",
+                            reply_to_message_id=reply_to_message_id)
+            return
+
+        session_filename = SESSION_FILES.get(provider)
+        if not session_filename:
+            self._send_text(chat_id, f"No session-file mapping for provider {provider}.",
+                            reply_to_message_id=reply_to_message_id)
+            return
+        session_file = find_project_session_file(self.project_root, session_filename)
+        if not session_file or not session_file.exists():
+            self._send_text(chat_id, f"{provider} is not mounted for this project.",
+                            reply_to_message_id=reply_to_message_id)
+            return
+
+        try:
+            data = json.loads(session_file.read_text(encoding="utf-8-sig"))
+        except Exception as exc:
+            self._send_text(chat_id, f"Couldn't read {provider} session: {exc}",
+                            reply_to_message_id=reply_to_message_id)
+            return
+
+        terminal = (data.get("terminal") or "tmux").strip().lower()
+        pane_id = str(data.get("pane_id") or data.get("tmux_session") or "").strip()
+        if not pane_id:
+            self._send_text(chat_id, f"{provider} session has no pane_id.",
+                            reply_to_message_id=reply_to_message_id)
+            return
+
+        if terminal != "tmux":
+            self._send_text(
+                chat_id,
+                f"/{command} passthrough is tmux-only for now "
+                f"(this pane is {terminal}).",
+                reply_to_message_id=reply_to_message_id,
+            )
+            return
+
+        # /compact can take a while (Claude summarizes the whole session);
+        # /context is instant. Tune the wait accordingly so we catch the
+        # output without blocking the telegramd worker for too long.
+        wait_s = 15 if command == "compact" else 4
+
+        try:
+            # Send the slash command + Enter into the Claude pane.
+            subprocess.run(["tmux", "send-keys", "-t", pane_id, f"/{command}"],
+                           check=True, capture_output=True)
+            # Small delay so the CLI registers the line before we press Enter.
+            time.sleep(0.2)
+            subprocess.run(["tmux", "send-keys", "-t", pane_id, "Enter"],
+                           check=True, capture_output=True)
+        except Exception as exc:
+            self._send_text(chat_id, f"tmux send-keys failed: {exc}",
+                            reply_to_message_id=reply_to_message_id)
+            return
+
+        time.sleep(wait_s)
+
+        try:
+            cap = subprocess.run(
+                ["tmux", "capture-pane", "-p", "-t", pane_id, "-S", "-80"],
+                check=True, capture_output=True, text=True,
+            )
+            tail = (cap.stdout or "").rstrip()
+        except Exception as exc:
+            self._send_text(chat_id, f"tmux capture-pane failed: {exc}",
+                            reply_to_message_id=reply_to_message_id)
+            return
+
+        # Trim leading box-drawing / UI chrome noise: try to find the last
+        # occurrence of `/command` we just typed and keep everything below.
+        marker = f"/{command}"
+        idx = tail.rfind(marker)
+        body = tail[idx:].strip() if idx >= 0 else tail
+        if len(body) > 3500:
+            body = body[:3500] + "\n…(truncated)"
+
+        self._send_text(
+            chat_id,
+            f"[{provider.capitalize()} /{command}]\n```\n{body}\n```",
+            reply_to_message_id=reply_to_message_id,
+        )
 
 
 def start_daemon(foreground: bool = False, work_dir: str | Path | None = None) -> None:
