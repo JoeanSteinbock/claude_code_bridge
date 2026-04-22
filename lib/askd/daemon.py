@@ -122,6 +122,13 @@ class UnifiedAskDaemon:
         self.token = random_token()
         self.registry = registry or ProviderRegistry()
         self.pool = _UnifiedWorkerPool(self.registry)
+        # Fall back to cwd when the caller didn't pass a work_dir. Otherwise
+        # the wake scheduler's `if not self.work_dir: return` short-circuit
+        # silently disables all wake dispatch for this project — which is
+        # exactly what happens when `ask` auto-starts askd without plumbing
+        # through CCB_WORK_DIR.
+        if not (isinstance(work_dir, str) and work_dir.strip()):
+            work_dir = os.getcwd()
         self.work_dir = work_dir
         # Keyed by id(task) because QueuedTask is an unfrozen dataclass and thus unhashable.
         self._active_tasks: dict = {}

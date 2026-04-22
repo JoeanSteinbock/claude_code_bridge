@@ -106,6 +106,23 @@ def cmd_add(args: argparse.Namespace) -> int:
     caller = _resolve_caller(args.caller)
     project_root = resolve_project_root()
 
+    # For telegram wakes, prepend an explicit reminder that the model must
+    # reply via Telegram. The base `channel_reply_instruction` already tells
+    # the model to use Telegram formatting, but some models will otherwise
+    # print progress or side channels to the terminal pane — which the user
+    # can't see when they're only on Telegram. This line makes the
+    # "deliver everything user-facing here" requirement impossible to miss.
+    if caller == "telegram":
+        reminder = (
+            "[wake trigger] You are being woken up by a scheduled `wake` entry. "
+            "The human is only reachable via Telegram right now — do NOT send "
+            "status, progress, or the final answer to any terminal pane. "
+            "Every user-facing output must go in the Telegram reply to this "
+            "request. If the task requires background work, keep it terse "
+            "and summarize in the reply."
+        )
+        message = f"{reminder}\n\n{message}"
+
     entry: dict = {
         "wake_id": make_req_id(),
         "agent": agent,

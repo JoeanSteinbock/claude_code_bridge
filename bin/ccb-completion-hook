@@ -522,6 +522,35 @@ def main() -> int:
     if caller == "manual":
         return 0
 
+    # Handle telegram caller - post reply to the originating Telegram chat.
+    # ONLY for out-of-band paths (wake-triggered asks, scheduled jobs) where
+    # nobody is reading the `ask` subprocess's stdout. The wake scheduler
+    # marks those by setting CCB_TELEGRAM_CHAT_ID explicitly. For normal
+    # user→telegramd→ask cycles the chat_id env var is absent because
+    # telegramd itself already relayed the reply via subprocess stdout;
+    # re-posting here would double-deliver.
+    if caller == "telegram":
+        chat_id = os.environ.get("CCB_TELEGRAM_CHAT_ID", "").strip()
+        if not chat_id:
+            _debug_log("telegram caller w/o CCB_TELEGRAM_CHAT_ID — assuming sync stdout delivery, skipping hook post")
+            return 0
+        try:
+            sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+            from telegramd_client import send_telegram_message
+        except Exception as exc:
+            _debug_log(f"telegram caller: import failed: {exc}")
+            return 1
+        work_dir = os.environ.get("CCB_WORK_DIR", "") or None
+        try:
+            marker = completion_status_marker(status)
+            body = f"[{provider.capitalize()}]\n{marker}\n{reply_content}" if marker else f"[{provider.capitalize()}] {reply_content}"
+            result = send_telegram_message(body, work_dir=work_dir, chat_ids=[chat_id])
+            _debug_log(f"telegram send work_dir={work_dir!r} chat_id={chat_id!r} result={result}")
+            return 0 if result.get("success") else 1
+        except Exception as exc:
+            _debug_log(f"telegram send exception: {exc}")
+            return 1
+
     # Terminal caller - construct notification message
     provider_names = {
         "codex": "Codex",

@@ -3815,6 +3815,38 @@ def cmd_start(args):
 
     # Enforce single ccb instance per directory.
     lock_cwd = str(Path.cwd().resolve())
+
+    # When replace_existing is requested, also kill any orphan ccb supervisors
+    # whose cwd matches ours but that aren't the lock holder. This catches the
+    # "stacked supervisors" state where a stale/lost lock file let multiple
+    # ccb processes survive in parallel — none of which `_replace_existing_ccb_instance`
+    # would target by pid-in-lockfile alone.
+    if effective_replace_existing:
+        orphans = _scan_ccb_supervisors_for_cwd(lock_cwd)
+        if orphans:
+            _source = "ccb.config (flags.replace_existing)" if (_cfg_replace_existing and not getattr(args, "replace_existing", False)) else "--replace-existing"
+            print(
+                f"ℹ️ Found {len(orphans)} orphan ccb supervisor(s) for this directory: {orphans} [{_source}]. Terminating.",
+                file=sys.stderr,
+            )
+            try:
+                from telegramd_client import stop_telegram_service
+                stop_telegram_service(lock_cwd)
+            except Exception:
+                pass
+            for orphan_pid in orphans:
+                _kill_pid(orphan_pid, force=False)
+            # Give them a moment to exit gracefully, then force.
+            deadline = time.time() + 3.0
+            while time.time() < deadline:
+                still = [p for p in orphans if _is_pid_alive(p)]
+                if not still:
+                    break
+                time.sleep(0.1)
+            for orphan_pid in orphans:
+                if _is_pid_alive(orphan_pid):
+                    _kill_pid(orphan_pid, force=True)
+
     ccb_lock = ProviderLock("ccb", timeout=0.1, cwd=lock_cwd)
     if not ccb_lock.try_acquire():
         pid = ""
@@ -4069,11 +4101,66 @@ def _kill_pid(pid: int, force: bool = False) -> bool:
         return False
 
 
-def _replace_existing_ccb_instance(lock_cwd: str, pid: int, timeout_s: float = 8.0) -> bool:
-    """Terminate the ccb instance holding the directory lock and wait for release."""
-    if pid <= 0:
-        return False
+def _scan_ccb_supervisors_for_cwd(lock_cwd: str) -> list[int]:
+    """Return pids of ccb supervisor processes whose cwd matches `lock_cwd`,
+    excluding self.
 
+    Relies on /proc so it is Linux/macOS-only. On platforms without /proc it
+    returns an empty list and the caller should fall back to the lock-file
+    pid path.
+    """
+    if os.name == "nt" or not Path("/proc").is_dir():
+        return []
+
+    try:
+        target_cwd = str(Path(lock_cwd).resolve())
+    except Exception:
+        target_cwd = str(lock_cwd)
+    self_pid = os.getpid()
+    matches: list[int] = []
+    try:
+        proc_entries = list(Path("/proc").iterdir())
+    except OSError:
+        return []
+
+    for entry in proc_entries:
+        name = entry.name
+        if not name.isdigit():
+            continue
+        pid = int(name)
+        if pid == self_pid:
+            continue
+        # Match by cmdline: the python invocation of the ccb launcher.
+        try:
+            cmdline_bytes = (entry / "cmdline").read_bytes()
+        except OSError:
+            continue
+        if not cmdline_bytes:
+            continue
+        argv = cmdline_bytes.split(b"\0")
+        if not any(b"ccb" in a and (a.endswith(b"/ccb") or a == b"ccb") for a in argv):
+            continue
+        # Must be a python interpreter invocation (not a wrapper shell etc.).
+        if not (argv and b"python" in argv[0].lower()):
+            continue
+        try:
+            proc_cwd = str(Path(os.readlink(str(entry / "cwd"))).resolve())
+        except OSError:
+            continue
+        if proc_cwd == target_cwd:
+            matches.append(pid)
+    return matches
+
+
+def _replace_existing_ccb_instance(lock_cwd: str, pid: int, timeout_s: float = 8.0) -> bool:
+    """Terminate any ccb supervisor(s) for this directory and wait for lock release.
+
+    `pid` is the pid recorded in the lock file (authoritative when the lock is
+    consistent). We also scan /proc for sibling supervisors whose cwd matches
+    — those can exist if the lock file was briefly lost (fcntl/unlink race) or
+    a previous kill missed them. Killing all of them closes the "stacked
+    supervisors" failure mode.
+    """
     # Stop the project's telegramd first. If we leave it running, the detached
     # subprocess survives when we SIGKILL the old ccb and fights the new
     # telegramd for getUpdates (HTTP 409), spawning orphan ask children.
@@ -4083,23 +4170,47 @@ def _replace_existing_ccb_instance(lock_cwd: str, pid: int, timeout_s: float = 8
     except Exception:
         pass
 
-    if not _kill_pid(pid, force=False):
+    targets: list[int] = []
+    if pid > 0:
+        targets.append(pid)
+    for extra in _scan_ccb_supervisors_for_cwd(lock_cwd):
+        if extra not in targets:
+            targets.append(extra)
+
+    if not targets:
         return False
 
-    deadline = time.time() + max(0.5, timeout_s)
-    while time.time() < deadline:
+    for target in targets:
+        _kill_pid(target, force=False)
+
+    def _lock_free() -> bool:
         probe = ProviderLock("ccb", timeout=0.1, cwd=lock_cwd)
         if probe.try_acquire():
             probe.release()
             return True
+        return False
+
+    def _all_dead() -> bool:
+        for target in targets:
+            try:
+                os.kill(target, 0)
+                return False
+            except OSError:
+                continue
+        return True
+
+    deadline = time.time() + max(0.5, timeout_s)
+    while time.time() < deadline:
+        if _all_dead() and _lock_free():
+            return True
         time.sleep(0.1)
 
-    _kill_pid(pid, force=True)
+    for target in targets:
+        _kill_pid(target, force=True)
+
     deadline = time.time() + 3.0
     while time.time() < deadline:
-        probe = ProviderLock("ccb", timeout=0.1, cwd=lock_cwd)
-        if probe.try_acquire():
-            probe.release()
+        if _all_dead() and _lock_free():
             return True
         time.sleep(0.1)
 

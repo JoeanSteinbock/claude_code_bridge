@@ -99,22 +99,42 @@ class ProviderLock:
             return False
 
     def _check_stale_lock(self) -> bool:
-        """Check if current lock holder is dead, allowing us to take over."""
+        """Check if current lock holder is dead, allowing us to take over.
+
+        Uses rename-then-unlink to close the race where two callers both
+        decide the lock is stale at the same time. Only one of them wins the
+        rename; the loser sees ENOENT and bails out.
+        """
         try:
             with open(self.lock_file, "r") as f:
                 content = f.read().strip()
-                if content:
-                    pid = int(content)
-                    if not _is_pid_alive(pid):
-                        # Stale lock - remove it
-                        try:
-                            self.lock_file.unlink()
-                        except OSError:
-                            pass
-                        return True
-        except (OSError, ValueError):
-            pass
-        return False
+            if not content:
+                return False
+            try:
+                pid = int(content)
+            except ValueError:
+                return False
+            if _is_pid_alive(pid):
+                return False
+
+            # Atomic rename: only one concurrent caller can take ownership of
+            # the stale file. Losers get FileNotFoundError on the rename and
+            # return False so they retry acquire on the fresh inode the winner
+            # will create.
+            stash = self.lock_file.with_name(
+                f"{self.lock_file.name}.stale.{os.getpid()}.{int(time.time() * 1000)}"
+            )
+            try:
+                os.rename(str(self.lock_file), str(stash))
+            except OSError:
+                return False
+            try:
+                stash.unlink()
+            except OSError:
+                pass
+            return True
+        except OSError:
+            return False
 
     def try_acquire(self) -> bool:
         """Try to acquire lock without blocking. Returns immediately.
@@ -123,7 +143,7 @@ class ProviderLock:
             True if lock acquired, False if lock is held by another process
         """
         self.lock_dir.mkdir(parents=True, exist_ok=True)
-        self._fd = os.open(str(self.lock_file), os.O_CREAT | os.O_RDWR)
+        self._fd = os.open(str(self.lock_file), os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0))
 
         if self._try_acquire_once():
             return True
@@ -131,7 +151,7 @@ class ProviderLock:
         # Check for stale lock
         if self._check_stale_lock():
             os.close(self._fd)
-            self._fd = os.open(str(self.lock_file), os.O_CREAT | os.O_RDWR)
+            self._fd = os.open(str(self.lock_file), os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0))
             if self._try_acquire_once():
                 return True
 
@@ -147,7 +167,7 @@ class ProviderLock:
             True if lock acquired, False if timeout
         """
         self.lock_dir.mkdir(parents=True, exist_ok=True)
-        self._fd = os.open(str(self.lock_file), os.O_CREAT | os.O_RDWR)
+        self._fd = os.open(str(self.lock_file), os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0))
 
         deadline = time.time() + self.timeout
         stale_checked = False
@@ -162,7 +182,7 @@ class ProviderLock:
                 if self._check_stale_lock():
                     # Lock file was stale, reopen and retry
                     os.close(self._fd)
-                    self._fd = os.open(str(self.lock_file), os.O_CREAT | os.O_RDWR)
+                    self._fd = os.open(str(self.lock_file), os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0))
                     if self._try_acquire_once():
                         return True
 

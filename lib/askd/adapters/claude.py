@@ -50,6 +50,91 @@ def _tail_state_for_log(log_path_val: Optional[Path], *, tail_bytes: int) -> dic
     return {"session_path": log_path_val, "offset": offset, "carry": b""}
 
 
+def _scrape_session_tail_for_req(session_path: Optional[Path], req_id: str) -> str:
+    """Best-effort pane-tail scrape when Claude never emitted CCB_DONE.
+
+    Opens the session JSONL, finds the anchor user line (our `CCB_REQ_ID
+    <req_id>`), then collects every assistant block after it. Returns a
+    short human-readable summary — the model's actual text if any, plus a
+    compact list of the last ~8 tool calls. Prefixed so the human knows
+    it's best-effort.
+
+    Returns "" on any failure so the caller can fall back further.
+    """
+    import json
+    if not session_path:
+        return ""
+    try:
+        path = Path(session_path)
+        if not path.exists():
+            return ""
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return ""
+
+    anchor_idx: Optional[int] = None
+    for i, line in enumerate(lines):
+        if req_id in line and "CCB_REQ_ID" in line:
+            anchor_idx = i
+            # Don't break — prefer the LAST occurrence in case the marker
+            # appears in our own scrape output from a previous rescue.
+    if anchor_idx is None:
+        return ""
+
+    texts: list[str] = []
+    tool_calls: list[str] = []
+    for line in lines[anchor_idx + 1 :]:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except Exception:
+            continue
+        etype = entry.get("type")
+        if etype != "assistant":
+            continue
+        msg = entry.get("message") or {}
+        content = msg.get("content") or []
+        if isinstance(content, str):
+            texts.append(content)
+            continue
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type")
+            if btype == "text":
+                t = str(block.get("text") or "").strip()
+                if t:
+                    texts.append(t)
+            elif btype == "tool_use":
+                name = str(block.get("name") or "tool").strip()
+                inp = block.get("input") or {}
+                descr = ""
+                if isinstance(inp, dict):
+                    for key in ("command", "file_path", "pattern", "path", "url"):
+                        v = inp.get(key)
+                        if isinstance(v, str) and v.strip():
+                            descr = v.strip()
+                            break
+                tool_calls.append(f"{name}({descr[:60]})" if descr else name)
+
+    prose = "\n\n".join(texts).strip()
+    last_tools = tool_calls[-8:]
+    parts: list[str] = []
+    parts.append("[no completion marker — tail snapshot]")
+    if prose:
+        parts.append(prose)
+    if last_tools:
+        parts.append("Last tool activity:\n" + "\n".join(f"• {t}" for t in last_tools))
+    if len(parts) == 1:
+        # Nothing useful to show.
+        return ""
+    return "\n\n".join(parts)
+
+
 _BOX_TABLE_CHARS = {"┌", "┬", "┐", "├", "┼", "┤", "└", "┴", "┘", "│", "─"}
 
 
@@ -557,7 +642,27 @@ class ClaudeAdapter(BaseProviderAdapter):
             task, session, session_key, started_ms, log_reader, state, backend, pane_id, deadline
         )
         result.reply = self._postprocess_reply(req, result.reply)
+        # Stuck-agent rescue: when our log-reader didn't collect any
+        # content (e.g. Claude got stuck inside a long tool call and the
+        # turn timed out before emitting CCB_DONE), try scraping the
+        # session JSONL directly. Any prose or tool activity we find is
+        # more useful than "Task ended without a confirmed completion
+        # marker." Only runs when the primary reply is still empty.
+        if not (result.reply or "").strip() and not result.done_seen:
+            scraped = _scrape_session_tail_for_req(
+                Path(session.claude_session_path) if session.claude_session_path else None,
+                task.req_id,
+            )
+            if scraped:
+                _write_log(f"[INFO] rescue: session-tail scrape used for req_id={task.req_id}")
+                result.reply = scraped
         self._finalize_result(result, req, task)
+        if not (result.reply or "").strip():
+            status = result.status or (
+                COMPLETION_STATUS_CANCELLED if task.cancelled
+                else (COMPLETION_STATUS_COMPLETED if result.done_seen else COMPLETION_STATUS_INCOMPLETE)
+            )
+            result.reply = default_reply_for_status(status, done_seen=result.done_seen)
         return result
 
     def _finalize_result(self, result: ProviderResult, req: ProviderRequest, task: QueuedTask) -> None:

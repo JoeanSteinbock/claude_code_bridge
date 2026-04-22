@@ -1,0 +1,235 @@
+#!/usr/bin/env python3
+"""
+expose — publish a local dev server at https://<subdomain>.luc.wtf via the
+`vps-luc-wtf` Cloudflare tunnel.
+
+Usage:
+    expose <port> [subdomain]        # default subdomain: basename($PWD)
+    expose --list
+    expose --remove <subdomain>
+    expose --url <subdomain>         # just print the URL (no changes)
+
+State layout:
+    ~/.cloudflared/ingress.d/<subdomain>.json   one file per exposed route
+    ~/.cloudflared/config.yml                    regenerated from fragments
+
+After each mutation, the CLI reloads the tunnel via `systemctl --user
+reload cloudflared` (SIGHUP) so cloudflared picks up the new ingress
+rules without dropping existing connections.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+TUNNEL_ID = "3636c660-de78-4fb0-9b68-465d669c19fb"
+BASE_DOMAIN = "luc.wtf"
+HOME = Path.home()
+CFD_DIR = HOME / ".cloudflared"
+INGRESS_D = CFD_DIR / "ingress.d"
+CONFIG_YML = CFD_DIR / "config.yml"
+CREDS_PATH = CFD_DIR / f"{TUNNEL_ID}.json"
+
+SUB_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
+
+
+def _die(msg: str, code: int = 2) -> None:
+    print(f"expose: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def _normalize_subdomain(raw: str) -> str:
+    sub = (raw or "").strip().lower()
+    # Accept user passing "foo.luc.wtf" and strip the base domain.
+    if sub.endswith(f".{BASE_DOMAIN}"):
+        sub = sub[: -len(f".{BASE_DOMAIN}")]
+    if not sub:
+        _die("empty subdomain")
+    if not SUB_RE.match(sub):
+        _die(
+            f"invalid subdomain {sub!r}: "
+            "must be [a-z0-9-], no leading/trailing dash, 1–63 chars"
+        )
+    return sub
+
+
+def _default_subdomain() -> str:
+    # basename of $PWD, normalized. e.g. /home/ccb/projects/xbtoshi/game-310 → game-310
+    cwd = Path.cwd()
+    return _normalize_subdomain(cwd.name)
+
+
+def _write_fragment(sub: str, port: int) -> None:
+    INGRESS_D.mkdir(parents=True, exist_ok=True)
+    entry = {
+        "hostname": f"{sub}.{BASE_DOMAIN}",
+        "service": f"http://localhost:{port}",
+        # Relax timeouts a touch for dev servers that stream / websocket.
+        "originRequest": {
+            "connectTimeout": "30s",
+            "noTLSVerify": True,
+        },
+    }
+    (INGRESS_D / f"{sub}.json").write_text(json.dumps(entry, indent=2) + "\n")
+
+
+def _remove_fragment(sub: str) -> bool:
+    p = INGRESS_D / f"{sub}.json"
+    if not p.exists():
+        return False
+    p.unlink()
+    return True
+
+
+def _load_fragments() -> list[dict]:
+    out: list[dict] = []
+    if not INGRESS_D.is_dir():
+        return out
+    for path in sorted(INGRESS_D.glob("*.json")):
+        try:
+            out.append(json.loads(path.read_text()))
+        except Exception as exc:
+            print(f"expose: warn: skipping bad fragment {path.name}: {exc}", file=sys.stderr)
+    return out
+
+
+def _yaml_quote(value: str) -> str:
+    # Very small YAML scalar emitter: always double-quote to avoid
+    # special-char ambiguity (wildcards, colons, etc.).
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def _render_config(fragments: list[dict]) -> str:
+    lines = [
+        f"tunnel: {TUNNEL_ID}",
+        f"credentials-file: {CREDS_PATH}",
+        "",
+        "ingress:",
+    ]
+    for frag in fragments:
+        hostname = frag.get("hostname") or ""
+        service = frag.get("service") or "http_status:404"
+        lines.append(f"  - hostname: {_yaml_quote(hostname)}")
+        lines.append(f"    service: {_yaml_quote(service)}")
+        origin = frag.get("originRequest") or {}
+        if isinstance(origin, dict) and origin:
+            lines.append("    originRequest:")
+            for k, v in origin.items():
+                if isinstance(v, bool):
+                    lines.append(f"      {k}: {'true' if v else 'false'}")
+                elif isinstance(v, (int, float)):
+                    lines.append(f"      {k}: {v}")
+                else:
+                    lines.append(f"      {k}: {_yaml_quote(str(v))}")
+    # Final catch-all (required by cloudflared).
+    lines.append('  - hostname: "*.luc.wtf"')
+    lines.append("    service: http_status:404")
+    lines.append("  - service: http_status:404")
+    return "\n".join(lines) + "\n"
+
+
+def _write_config() -> None:
+    config = _render_config(_load_fragments())
+    CONFIG_YML.write_text(config)
+
+
+def _reload_tunnel() -> None:
+    """Apply config.yml changes by restarting cloudflared.
+
+    cloudflared 2026.x has no in-process reload — SIGHUP is treated as a
+    termination signal. So the CLI does `systemctl --user restart`, which
+    briefly drops the tunnel (~1-3s) and comes back with the new ingress.
+    For dev previews this is fine; for prod we'd want a two-tunnel blue/
+    green flip instead.
+
+    Requires XDG_RUNTIME_DIR. Most non-login shells won't have it set —
+    we fill it in from the caller's uid.
+    """
+    env = os.environ.copy()
+    if not env.get("XDG_RUNTIME_DIR"):
+        env["XDG_RUNTIME_DIR"] = f"/run/user/{os.getuid()}"
+
+    try:
+        subprocess.run(
+            ["systemctl", "--user", "restart", "cloudflared"],
+            check=True, capture_output=True, env=env,
+        )
+    except FileNotFoundError:
+        print("expose: warn: systemctl not found; cloudflared must be restarted manually", file=sys.stderr)
+    except subprocess.CalledProcessError as exc:
+        msg = (exc.stderr or b"").decode("utf-8", errors="replace").strip()
+        print(f"expose: warn: systemctl restart failed: {msg}", file=sys.stderr)
+
+
+def cmd_add(port: int, sub: str) -> int:
+    if port <= 0 or port > 65535:
+        _die(f"invalid port {port}")
+    sub = _normalize_subdomain(sub)
+    _write_fragment(sub, port)
+    _write_config()
+    _reload_tunnel()
+    print(f"https://{sub}.{BASE_DOMAIN}  →  http://localhost:{port}")
+    return 0
+
+
+def cmd_remove(sub: str) -> int:
+    sub = _normalize_subdomain(sub)
+    removed = _remove_fragment(sub)
+    if not removed:
+        print(f"expose: {sub}.{BASE_DOMAIN} was not exposed", file=sys.stderr)
+        return 1
+    _write_config()
+    _reload_tunnel()
+    print(f"removed {sub}.{BASE_DOMAIN}")
+    return 0
+
+
+def cmd_list() -> int:
+    fragments = _load_fragments()
+    if not fragments:
+        print("(no routes)")
+        return 0
+    for frag in fragments:
+        print(f"{frag.get('hostname'):<40} {frag.get('service')}")
+    return 0
+
+
+def cmd_url(sub: str) -> int:
+    sub = _normalize_subdomain(sub)
+    print(f"https://{sub}.{BASE_DOMAIN}")
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="expose",
+        description="Publish a local dev server at https://<sub>.luc.wtf via Cloudflare Tunnel.",
+    )
+    parser.add_argument("--list", action="store_true", help="list exposed routes")
+    parser.add_argument("--remove", metavar="SUB", help="remove an existing route")
+    parser.add_argument("--url", metavar="SUB", help="print the URL for a subdomain (no side effects)")
+    parser.add_argument("port", nargs="?", type=int, help="local TCP port to expose")
+    parser.add_argument("subdomain", nargs="?", help="subdomain (default: basename of cwd)")
+    args = parser.parse_args(argv[1:])
+
+    if args.list:
+        return cmd_list()
+    if args.remove:
+        return cmd_remove(args.remove)
+    if args.url:
+        return cmd_url(args.url)
+    if args.port is None:
+        parser.print_help(file=sys.stderr)
+        return 2
+    sub = args.subdomain or _default_subdomain()
+    return cmd_add(args.port, sub)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
