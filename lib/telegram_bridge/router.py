@@ -114,6 +114,19 @@ def parse_message(text: str, default_provider: str) -> ParsedTelegramText:
                 return ParsedTelegramText(provider=target, message="", command=cname)
             return ParsedTelegramText(provider="claude", message="", command=cname)
 
+    # /tail <provider> (alias /peek, /last) — snapshot the provider's
+    # pane without touching it. Read-only; doesn't inject a slash
+    # command or interrupt whatever the model is doing.
+    for stem in ("/tail", "/peek", "/last"):
+        if lowered == stem:
+            return ParsedTelegramText(provider="claude", message="", command="tail")
+        if lowered.startswith(stem + " "):
+            rest = raw[len(stem) + 1:].strip().lower()
+            target = _normalize_provider(rest) if rest else ""
+            if target and target != "all":
+                return ParsedTelegramText(provider=target, message="", command="tail")
+            return ParsedTelegramText(provider="claude", message="", command="tail")
+
     if lowered.startswith("/ask "):
         parts = raw.split(None, 2)
         if len(parts) >= 3:

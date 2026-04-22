@@ -232,6 +232,7 @@ class TelegramDaemon:
                 {"command": "compact", "description": "compact Claude's conversation context"},
                 {"command": "status", "description": "show Claude's session status"},
                 {"command": "stats", "description": "alias for /status"},
+                {"command": "tail", "description": "peek at latest pane output (e.g. /tail codex)"},
                 {"command": "providers", "description": "list available providers"},
                 {"command": "help", "description": "show usage"},
             ])
@@ -503,6 +504,9 @@ class TelegramDaemon:
         if parsed.command in ("context", "compact", "status"):
             self._run_slash_passthrough(parsed.command, parsed.provider or "claude",
                                         chat_id, reply_to)
+            return
+        if parsed.command == "tail":
+            self._run_tail_command(parsed.provider or "claude", chat_id, reply_to)
             return
         if not parsed.message:
             self._send_text(chat_id, "Empty message.", reply_to_message_id=reply_to)
@@ -938,6 +942,84 @@ class TelegramDaemon:
 
         self._send_text(chat_id, "Respawn:\n" + "\n".join(results),
                         reply_to_message_id=reply_to_message_id)
+
+    def _run_tail_command(
+        self,
+        provider: str,
+        chat_id: str,
+        reply_to_message_id: int,
+    ) -> None:
+        """Snapshot the provider's tmux pane and post the tail back.
+
+        Read-only — doesn't type anything into the pane. Useful for
+        checking on a long-running turn remotely without interrupting it.
+        """
+        provider = (provider or "claude").strip().lower()
+        if provider not in SUPPORTED_PROVIDERS:
+            self._send_text(chat_id, f"Unknown provider: {provider}",
+                            reply_to_message_id=reply_to_message_id)
+            return
+        session_filename = SESSION_FILES.get(provider)
+        if not session_filename:
+            self._send_text(chat_id, f"No session-file mapping for provider {provider}.",
+                            reply_to_message_id=reply_to_message_id)
+            return
+        session_file = find_project_session_file(self.project_root, session_filename)
+        if not session_file or not session_file.exists():
+            self._send_text(chat_id, f"{provider} is not mounted for this project.",
+                            reply_to_message_id=reply_to_message_id)
+            return
+
+        try:
+            data = json.loads(session_file.read_text(encoding="utf-8-sig"))
+        except Exception as exc:
+            self._send_text(chat_id, f"Couldn't read {provider} session: {exc}",
+                            reply_to_message_id=reply_to_message_id)
+            return
+
+        terminal = (data.get("terminal") or "tmux").strip().lower()
+        pane_id = str(data.get("pane_id") or data.get("tmux_session") or "").strip()
+        if not pane_id:
+            self._send_text(chat_id, f"{provider} session has no pane_id.",
+                            reply_to_message_id=reply_to_message_id)
+            return
+        if terminal != "tmux":
+            self._send_text(
+                chat_id,
+                f"/tail is tmux-only for now (this pane is {terminal}).",
+                reply_to_message_id=reply_to_message_id,
+            )
+            return
+
+        try:
+            cap = subprocess.run(
+                ["tmux", "capture-pane", "-p", "-t", pane_id, "-S", "-80"],
+                check=True, capture_output=True, text=True,
+            )
+            tail = (cap.stdout or "").rstrip()
+        except Exception as exc:
+            self._send_text(chat_id, f"tmux capture-pane failed: {exc}",
+                            reply_to_message_id=reply_to_message_id)
+            return
+
+        # Collapse trailing blank lines; Telegram markdown hates huge blobs,
+        # so cap at ~3500 chars (covers both message limit + code-fence
+        # overhead). Preserve the MOST RECENT content by trimming head.
+        lines = [ln.rstrip() for ln in tail.split("\n")]
+        while lines and not lines[-1].strip():
+            lines.pop()
+        body = "\n".join(lines)
+        if len(body) > 3500:
+            body = "…(older output truncated)\n" + body[-3400:]
+
+        if not body:
+            body = "(pane is empty)"
+
+        self._send_text(
+            chat_id,
+            f"[{provider.capitalize()} tail]\n```\n{body}\n```",
+            reply_to_message_id=reply_to_message_id,
+        )
 
     def _run_slash_passthrough(
         self,
