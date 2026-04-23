@@ -685,8 +685,28 @@ class TelegramDaemon:
         env["CCB_ASK_EMIT_GUARDRAIL"] = "0"
         env["CCB_UNIFIED_ASKD"] = "1"
         env["CCB_ASKD_AUTOSTART"] = "0"
+        # Our own ask invocation captures stdout and posts the reply; the
+        # completion hook should NOT also post for this call. Flag it.
+        # Nested asks from Claude's pane don't inherit this env var (pane
+        # env is set at ccb startup), so their hook post still fires.
+        env["CCB_TELEGRAM_SYNC_REPLY"] = "1"
         env.pop("CCB_PARENT_PID", None)
         env.pop("CCB_MANAGED", None)
+
+        # Drop the chat_id in a project-scoped file. Nested asks that
+        # Claude fires from inside its pane (the `ask @codex …` delegation
+        # pattern) can't read telegramd's env, but the `ask` CLI falls
+        # back to this file so the completion hook has somewhere to send
+        # the eventual reply. The file is overwritten each turn, so the
+        # "active chat" is always the last Telegram sender — fine for the
+        # single-user DM setup we have.
+        if chat_id:
+            try:
+                active = self.project_root / ".ccb" / ".active_chat_id"
+                active.parent.mkdir(parents=True, exist_ok=True)
+                active.write_text(str(chat_id).strip() + "\n")
+            except Exception:
+                pass
         # Telegramd is a daemon, not a terminal pane. Stripping these prevents
         # `ask` from populating caller_pane_id with whatever pane happened to
         # be in the shell that launched telegramd — which would misroute

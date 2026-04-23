@@ -38,6 +38,9 @@ class ProviderRequest:
     # chat. Empty for normal (telegramd-invoked) asks where the stdout
     # delivery path handles the reply.
     telegram_chat_id: str = ""
+    # True when the caller (telegramd) captures our stdout and will post
+    # the reply itself — hook must skip to avoid double-delivery.
+    telegram_sync_reply: bool = False
 
 
 @dataclass

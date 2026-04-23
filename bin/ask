@@ -380,15 +380,30 @@ def _send_via_unified_daemon(
         req["email_msg_id"] = os.environ.get("CCB_EMAIL_MSG_ID", "")
         req["email_from"] = os.environ.get("CCB_EMAIL_FROM", "")
 
-    # Pass chat_id for telegram-caller wakes. The wake scheduler sets
-    # CCB_TELEGRAM_CHAT_ID in ask's env; include it in the RPC so askd can
-    # plumb it into the completion-hook env on the other side. Without this
-    # the hook can't post the reply (it has no way to learn the chat id
-    # from just the ProviderRequest otherwise).
+    # Pass chat_id for telegram-caller asks so the completion hook can
+    # post the reply back. Resolution order:
+    #   1) CCB_TELEGRAM_CHAT_ID env — set by the wake scheduler
+    #   2) <work_dir>/.ccb/.active_chat_id — written by telegramd on each
+    #      incoming message. Covers the case where Claude's pane fires a
+    #      nested `ask codex`; that subprocess doesn't inherit
+    #      telegramd's env but the file on disk is still there.
     if caller == "telegram":
         chat_id = os.environ.get("CCB_TELEGRAM_CHAT_ID", "").strip()
+        if not chat_id and daemon_work_dir:
+            try:
+                marker = Path(daemon_work_dir) / ".ccb" / ".active_chat_id"
+                if marker.exists():
+                    chat_id = marker.read_text(encoding="utf-8").strip().splitlines()[0].strip()
+            except Exception:
+                chat_id = ""
         if chat_id:
             req["telegram_chat_id"] = chat_id
+        # Mark this ask as "sync reply" when the caller (telegramd) will
+        # capture our stdout and post the reply itself. Hook must skip to
+        # avoid double-delivery. Nested asks (Claude → ask codex) don't
+        # have this env var set, so their hook-post path runs as normal.
+        if os.environ.get("CCB_TELEGRAM_SYNC_REPLY", "").strip() == "1":
+            req["telegram_sync_reply"] = True
 
     # Try to send request, with one retry on connection failure only
     request_sent = False
