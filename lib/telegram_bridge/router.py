@@ -103,6 +103,12 @@ def parse_message(text: str, default_provider: str) -> ParsedTelegramText:
         "/compact": "compact",
         "/status": "status",
         "/stats": "status",
+        "/usage": "usage",
+        "/cost": "cost",
+        "/config": "config",
+        "/model": "model",
+        "/mcp": "mcp",
+        "/sessions": "sessions",
     }
     for stem, cname in PASSTHROUGHS.items():
         if lowered == stem:

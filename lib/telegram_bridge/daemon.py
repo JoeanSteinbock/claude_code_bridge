@@ -233,6 +233,12 @@ class TelegramDaemon:
                 {"command": "status", "description": "show Claude's session status"},
                 {"command": "stats", "description": "alias for /status"},
                 {"command": "tail", "description": "peek at latest pane output (e.g. /tail codex)"},
+                {"command": "usage", "description": "show token/cost usage"},
+                {"command": "cost", "description": "show billing breakdown"},
+                {"command": "config", "description": "open Claude config dialog"},
+                {"command": "model", "description": "show/switch Claude model"},
+                {"command": "mcp", "description": "show MCP server status"},
+                {"command": "sessions", "description": "list Claude sessions"},
                 {"command": "providers", "description": "list available providers"},
                 {"command": "help", "description": "show usage"},
             ])
@@ -501,7 +507,8 @@ class TelegramDaemon:
                 reply_to_message_id=reply_to,
             )
             return
-        if parsed.command in ("context", "compact", "status"):
+        if parsed.command in ("context", "compact", "status", "usage", "cost",
+                              "config", "model", "mcp", "sessions"):
             self._run_slash_passthrough(parsed.command, parsed.provider or "claude",
                                         chat_id, reply_to)
             return
