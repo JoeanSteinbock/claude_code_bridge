@@ -139,6 +139,51 @@ def _write_config() -> None:
     CONFIG_YML.write_text(config)
 
 
+def _kill_orphan_cloudflared(systemd_main_pid: Optional[int] = None) -> None:
+    """Kill any cloudflared process that's using OUR config but isn't the
+    systemd-managed one.
+
+    Happened 2026-04-23: a cloudflared spawned during initial setup was
+    still alive after `systemctl enable --now cloudflared` wrapped the
+    service, holding the tunnel to Cloudflare. Every `systemctl restart`
+    recycled the systemd copy, but the orphan kept serving the stale
+    pre-expose ingress. Users saw 404 on newly-exposed subdomains.
+    """
+    if not Path("/proc").is_dir():
+        return
+    own_config = str(CONFIG_YML.resolve())
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if systemd_main_pid and pid == systemd_main_pid:
+            continue
+        try:
+            cmdline = (entry / "cmdline").read_bytes().decode("utf-8", "replace")
+        except OSError:
+            continue
+        if "cloudflared" not in cmdline:
+            continue
+        if own_config not in cmdline:
+            continue
+        try:
+            os.kill(pid, 15)  # SIGTERM
+            print(f"expose: killed orphan cloudflared pid={pid}", file=sys.stderr)
+        except OSError:
+            pass
+
+
+def _systemd_main_pid(env: dict) -> Optional[int]:
+    try:
+        out = subprocess.run(
+            ["systemctl", "--user", "show", "cloudflared", "--property=MainPID", "--value"],
+            check=True, capture_output=True, env=env, text=True,
+        ).stdout.strip()
+        return int(out) if out.isdigit() else None
+    except Exception:
+        return None
+
+
 def _reload_tunnel() -> None:
     """Apply config.yml changes by restarting cloudflared.
 
@@ -147,6 +192,9 @@ def _reload_tunnel() -> None:
     briefly drops the tunnel (~1-3s) and comes back with the new ingress.
     For dev previews this is fine; for prod we'd want a two-tunnel blue/
     green flip instead.
+
+    Also sweeps any orphan cloudflared processes (non-systemd) that might
+    be shadowing our config with a stale ingress — see _kill_orphan_cloudflared.
 
     Requires XDG_RUNTIME_DIR. Most non-login shells won't have it set —
     we fill it in from the caller's uid.
@@ -165,6 +213,11 @@ def _reload_tunnel() -> None:
     except subprocess.CalledProcessError as exc:
         msg = (exc.stderr or b"").decode("utf-8", errors="replace").strip()
         print(f"expose: warn: systemctl restart failed: {msg}", file=sys.stderr)
+
+    # After restart, read the new MainPID and kill anything else using our
+    # config. This catches the orphan case even if systemctl succeeded.
+    main_pid = _systemd_main_pid(env)
+    _kill_orphan_cloudflared(systemd_main_pid=main_pid)
 
 
 def cmd_add(port: int, sub: str) -> int:
