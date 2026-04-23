@@ -239,6 +239,7 @@ class TelegramDaemon:
                 {"command": "model", "description": "show/switch Claude model"},
                 {"command": "mcp", "description": "show MCP server status"},
                 {"command": "sessions", "description": "list Claude sessions"},
+                {"command": "wake", "description": "schedule a future ask (e.g. /wake 5m check BTC price)"},
                 {"command": "providers", "description": "list available providers"},
                 {"command": "help", "description": "show usage"},
             ])
@@ -514,6 +515,9 @@ class TelegramDaemon:
             return
         if parsed.command == "tail":
             self._run_tail_command(parsed.provider or "claude", chat_id, reply_to)
+            return
+        if parsed.command in ("wake_add", "wake_list", "wake_cancel", "wake_usage"):
+            self._run_wake_command(parsed, chat_id, reply_to)
             return
         if not parsed.message:
             self._send_text(chat_id, "Empty message.", reply_to_message_id=reply_to)
@@ -949,6 +953,110 @@ class TelegramDaemon:
 
         self._send_text(chat_id, "Respawn:\n" + "\n".join(results),
                         reply_to_message_id=reply_to_message_id)
+
+    def _run_wake_command(self, parsed, chat_id: str, reply_to_message_id: int) -> None:
+        """Schedule / list / cancel wakes from Telegram.
+
+        Shells out to the existing `wake` CLI instead of reimplementing
+        the queue format — keeps parity with what models and the terminal
+        shell already do. CCB_WORK_DIR is pinned to this project so the
+        queue file ends up at <project>/.ccb/wake_queue.json.
+        """
+        wake_cmd = shutil.which("wake") or str(
+            Path.home() / ".local" / "share" / "codex-dual" / "bin" / "wake"
+        )
+        if not Path(wake_cmd).is_file():
+            self._send_text(chat_id, "wake command not found on this host.",
+                            reply_to_message_id=reply_to_message_id)
+            return
+
+        env = os.environ.copy()
+        env["CCB_WORK_DIR"] = self._work_dir()
+
+        if parsed.command == "wake_usage":
+            self._send_text(
+                chat_id,
+                "Usage:\n"
+                "  /wake <duration> <message>             — agent defaults to claude\n"
+                "  /wake <agent> <duration> <message>     — explicit agent\n"
+                "  /wake list                             — show pending\n"
+                "  /wake cancel <wake_id>                 — remove one\n\n"
+                "Duration: 30s | 5m | 1h | 1h30m\n"
+                "Example: /wake 15m check BTC price + summarize",
+                reply_to_message_id=reply_to_message_id,
+            )
+            return
+
+        if parsed.command == "wake_list":
+            try:
+                out = subprocess.run(
+                    [wake_cmd, "list"], cwd=self._work_dir(), env=env,
+                    capture_output=True, text=True, timeout=10,
+                )
+            except Exception as exc:
+                self._send_text(chat_id, f"wake list failed: {exc}",
+                                reply_to_message_id=reply_to_message_id)
+                return
+            body = (out.stdout or "").strip() or "(no pending wakes)"
+            self._send_text(chat_id, f"```\n{body}\n```",
+                            reply_to_message_id=reply_to_message_id)
+            return
+
+        if parsed.command == "wake_cancel":
+            wake_id = (parsed.message or "").strip().split()[0] if parsed.message else ""
+            if not wake_id:
+                self._send_text(chat_id, "Usage: /wake cancel <wake_id>",
+                                reply_to_message_id=reply_to_message_id)
+                return
+            try:
+                out = subprocess.run(
+                    [wake_cmd, "cancel", wake_id], cwd=self._work_dir(), env=env,
+                    capture_output=True, text=True, timeout=10,
+                )
+            except Exception as exc:
+                self._send_text(chat_id, f"wake cancel failed: {exc}",
+                                reply_to_message_id=reply_to_message_id)
+                return
+            body = (out.stdout or out.stderr or "").strip() or f"rc={out.returncode}"
+            self._send_text(chat_id, body, reply_to_message_id=reply_to_message_id)
+            return
+
+        # wake_add
+        agent = (parsed.provider or "claude").strip().lower()
+        # parsed.message is "<duration> <message>"; split off duration.
+        parts = (parsed.message or "").split(None, 1)
+        if len(parts) < 2:
+            self._send_text(chat_id, "Usage: /wake <duration> <message>",
+                            reply_to_message_id=reply_to_message_id)
+            return
+        duration, message = parts[0].strip(), parts[1].strip()
+        if not message:
+            self._send_text(chat_id, "Message required.",
+                            reply_to_message_id=reply_to_message_id)
+            return
+        try:
+            out = subprocess.run(
+                [wake_cmd, "add", agent, "--in", duration,
+                 "--caller", "telegram", "--chat-id", str(chat_id), message],
+                cwd=self._work_dir(), env=env,
+                capture_output=True, text=True, timeout=15,
+            )
+        except Exception as exc:
+            self._send_text(chat_id, f"wake add failed: {exc}",
+                            reply_to_message_id=reply_to_message_id)
+            return
+        if out.returncode != 0:
+            err = (out.stderr or out.stdout or "").strip() or f"rc={out.returncode}"
+            self._send_text(chat_id, f"wake: {err}",
+                            reply_to_message_id=reply_to_message_id)
+            return
+        wake_id = (out.stdout or "").strip().splitlines()[0] if out.stdout else ""
+        self._send_text(
+            chat_id,
+            f"⏰ Wake scheduled: `{wake_id}`\n"
+            f"{agent} in {duration} → will reply here when it fires.",
+            reply_to_message_id=reply_to_message_id,
+        )
 
     def _run_tail_command(
         self,

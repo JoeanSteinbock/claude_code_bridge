@@ -10,6 +10,10 @@ from .config import SUPPORTED_PROVIDERS
 # Normalize to `/command [args]` before parsing.
 _BOT_MENTION_RE = re.compile(r"^(/\w+)@[A-Za-z0-9_]+", re.ASCII)
 
+# Duration string for /wake first-arg detection. Same grammar as the
+# wake CLI's own parser: "30s", "5m", "1h", or combos like "1h30m".
+_DUR_RE = re.compile(r"(?:\d+[smh])+", re.IGNORECASE)
+
 
 def _strip_bot_mention(raw: str) -> str:
     return _BOT_MENTION_RE.sub(r"\1", raw, count=1)
@@ -132,6 +136,39 @@ def parse_message(text: str, default_provider: str) -> ParsedTelegramText:
             if target and target != "all":
                 return ParsedTelegramText(provider=target, message="", command="tail")
             return ParsedTelegramText(provider="claude", message="", command="tail")
+
+    # /wake — schedule a future ask.
+    #
+    #   /wake list                                 — list pending wakes
+    #   /wake cancel <id>                          — cancel a wake
+    #   /wake <duration> <message>                 — default agent=claude
+    #   /wake <agent> <duration> <message>         — explicit agent
+    #
+    # Duration is a wake-duration string (e.g. 30s, 5m, 1h30m). The
+    # message keeps its original casing; only the routing prefix is
+    # lowercased.
+    if lowered == "/wake" or lowered.startswith("/wake "):
+        body = raw[5:].strip()
+        if not body:
+            return ParsedTelegramText(provider=None, message="", command="wake_usage")
+        parts = body.split(None, 1)
+        head = parts[0].lower()
+        rest = parts[1] if len(parts) > 1 else ""
+        if head == "list":
+            return ParsedTelegramText(provider=None, message="", command="wake_list")
+        if head == "cancel":
+            return ParsedTelegramText(provider=None, message=rest.strip(),
+                                      command="wake_cancel")
+        # Duration as the first token → default agent=claude.
+        if _DUR_RE.fullmatch(head):
+            return ParsedTelegramText(provider="claude", message=f"{head} {rest}".strip(),
+                                      command="wake_add")
+        # Otherwise first token must be an agent name.
+        target = _normalize_provider(head)
+        if target and target != "all" and rest:
+            return ParsedTelegramText(provider=target, message=rest.strip(),
+                                      command="wake_add")
+        return ParsedTelegramText(provider=None, message="", command="wake_usage")
 
     if lowered.startswith("/ask "):
         parts = raw.split(None, 2)
