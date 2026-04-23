@@ -1107,6 +1107,19 @@ class TelegramDaemon:
                             reply_to_message_id=reply_to_message_id)
             return
 
+        # Dismiss modal dialogs that Claude Code's /status, /context, /compact
+        # pop into the pane. They block the prompt until the user presses
+        # Escape. Without this the next ask() would send its text INTO the
+        # modal instead of the prompt field. Send Escape a couple times to
+        # be safe (covers multi-level nested modals).
+        try:
+            for _ in range(2):
+                subprocess.run(["tmux", "send-keys", "-t", pane_id, "Escape"],
+                               check=False, capture_output=True)
+                time.sleep(0.1)
+        except Exception:
+            pass
+
         # Trim leading box-drawing / UI chrome noise: try to find the last
         # occurrence of `/command` we just typed and keep everything below.
         marker = f"/{command}"
