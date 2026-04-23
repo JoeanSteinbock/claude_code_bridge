@@ -380,6 +380,16 @@ def _send_via_unified_daemon(
         req["email_msg_id"] = os.environ.get("CCB_EMAIL_MSG_ID", "")
         req["email_from"] = os.environ.get("CCB_EMAIL_FROM", "")
 
+    # Pass chat_id for telegram-caller wakes. The wake scheduler sets
+    # CCB_TELEGRAM_CHAT_ID in ask's env; include it in the RPC so askd can
+    # plumb it into the completion-hook env on the other side. Without this
+    # the hook can't post the reply (it has no way to learn the chat id
+    # from just the ProviderRequest otherwise).
+    if caller == "telegram":
+        chat_id = os.environ.get("CCB_TELEGRAM_CHAT_ID", "").strip()
+        if chat_id:
+            req["telegram_chat_id"] = chat_id
+
     # Try to send request, with one retry on connection failure only
     request_sent = False
     for attempt in range(2):

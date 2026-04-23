@@ -694,6 +694,7 @@ class ClaudeAdapter(BaseProviderAdapter):
             work_dir=req.work_dir,
             caller_pane_id=req.caller_pane_id,
             caller_terminal=req.caller_terminal,
+            telegram_chat_id=req.telegram_chat_id,
         )
 
     def _postprocess_reply(self, req: ProviderRequest, reply: str) -> str:

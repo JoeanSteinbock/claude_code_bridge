@@ -185,6 +185,7 @@ class UnifiedAskDaemon:
                 email_from=str(msg.get("email_from") or ""),
                 caller_pane_id=str(msg.get("caller_pane_id") or ""),
                 caller_terminal=str(msg.get("caller_terminal") or ""),
+                telegram_chat_id=str(msg.get("telegram_chat_id") or ""),
             )
         except Exception as exc:
             return {

@@ -33,6 +33,11 @@ class ProviderRequest:
     # Caller pane ID for direct routing back to the originating terminal pane
     caller_pane_id: str = ""
     caller_terminal: str = ""
+    # Telegram chat_id for wake-triggered asks. The wake scheduler sets
+    # this so the completion hook can post the reply back to the right
+    # chat. Empty for normal (telegramd-invoked) asks where the stdout
+    # delivery path handles the reply.
+    telegram_chat_id: str = ""
 
 
 @dataclass
