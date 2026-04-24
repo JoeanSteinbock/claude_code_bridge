@@ -118,11 +118,26 @@ def parse_message(text: str, default_provider: str) -> ParsedTelegramText:
         if lowered == stem:
             return ParsedTelegramText(provider="claude", message="", command=cname)
         if lowered.startswith(stem + " "):
-            rest = raw[len(stem) + 1:].strip().lower()
-            target = _normalize_provider(rest) if rest else ""
-            if target and target != "all":
-                return ParsedTelegramText(provider=target, message="", command=cname)
-            return ParsedTelegramText(provider="claude", message="", command=cname)
+            rest = raw[len(stem) + 1:].strip()
+            tokens = rest.split()
+            # Last token might be the target provider. If it matches a
+            # provider name, pop it; what remains is the slash-command
+            # argument list (e.g. `/model gpt-5.4 codex` → arg="gpt-5.4", target="codex").
+            target = ""
+            if tokens:
+                maybe_target = _normalize_provider(tokens[-1].lower()) if tokens else ""
+                if maybe_target and maybe_target != "all":
+                    target = maybe_target
+                    tokens = tokens[:-1]
+            arg = " ".join(tokens).strip()
+            # If target not found and the ONLY token is a provider, treat as no-arg.
+            if not target and not arg:
+                return ParsedTelegramText(provider="claude", message="", command=cname)
+            return ParsedTelegramText(
+                provider=target or "claude",
+                message=arg,   # carries the slash-command argument (empty if none)
+                command=cname,
+            )
 
     # /tail <provider> (alias /peek, /last) — snapshot the provider's
     # pane without touching it. Read-only; doesn't inject a slash

@@ -511,8 +511,11 @@ class TelegramDaemon:
             return
         if parsed.command in ("context", "compact", "status", "usage", "cost",
                               "config", "model", "mcp", "sessions"):
-            self._run_slash_passthrough(parsed.command, parsed.provider or "claude",
-                                        chat_id, reply_to)
+            self._run_slash_passthrough(
+                parsed.command, parsed.provider or "claude",
+                chat_id, reply_to,
+                arg=(parsed.message or "").strip(),
+            )
             return
         if parsed.command == "tail":
             self._run_tail_command(parsed.provider or "claude", chat_id, reply_to)
@@ -1183,6 +1186,7 @@ class TelegramDaemon:
         provider: str,
         chat_id: str,
         reply_to_message_id: int,
+        arg: str = "",
     ) -> None:
         """Type a provider-native slash command (`/context`, `/compact`) into
         the pane and return the output tail.
@@ -1239,7 +1243,8 @@ class TelegramDaemon:
 
         try:
             # Send the slash command + Enter into the Claude pane.
-            subprocess.run(["tmux", "send-keys", "-t", pane_id, f"/{command}"],
+            full_cmd = f"/{command} {arg}".strip() if arg else f"/{command}"
+            subprocess.run(["tmux", "send-keys", "-t", pane_id, full_cmd],
                            check=True, capture_output=True)
             # Small delay so the CLI registers the line before we press Enter.
             time.sleep(0.2)
