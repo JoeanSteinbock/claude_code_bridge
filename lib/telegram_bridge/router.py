@@ -137,6 +137,46 @@ def parse_message(text: str, default_provider: str) -> ParsedTelegramText:
                 return ParsedTelegramText(provider=target, message="", command="tail")
             return ParsedTelegramText(provider="claude", message="", command="tail")
 
+    # /work <agent> <duration> [hint] — wake shortcut with a work-first
+    # imperative. Expands to a full /wake_add request whose message tells
+    # the agent to (1) do real edits/commits, (2) report, (3) optionally
+    # self-reschedule. Needed because bare "/wake … progress report or
+    # schedule another" lets the model pick the lazy branch.
+    if lowered == "/work" or lowered.startswith("/work "):
+        body = raw[5:].strip()
+        if not body:
+            return ParsedTelegramText(provider=None, message="", command="work_usage")
+        parts = body.split(None, 2)
+        head = parts[0].lower()
+        # Duration-first form: /work <duration> [hint]
+        if _DUR_RE.fullmatch(head):
+            agent = "claude"
+            duration = head
+            hint = body[len(head):].strip()
+        else:
+            # Agent-first form: /work <agent> <duration> [hint]
+            agent = _normalize_provider(head)
+            if not agent or agent == "all" or len(parts) < 2 or not _DUR_RE.fullmatch(parts[1].lower()):
+                return ParsedTelegramText(provider=None, message="", command="work_usage")
+            duration = parts[1].lower()
+            hint = parts[2].strip() if len(parts) > 2 else ""
+
+        task = f" on {hint}" if hint else ""
+        prompt = (
+            f"Work{task} for this turn — make real edits / tool calls / commits (minimum 3 substantive actions). "
+            f"THEN post a concise progress report. "
+            f"THEN, if the task is not done, schedule another /work {agent} {duration}"
+            f"{' ' + hint if hint else ''} by calling "
+            f"`wake add {agent} --in {duration} --caller telegram --chat-id <this chat> "
+            f"\"{{same work prompt}}\"`. "
+            f"Do NOT reply with a report-only message — real work must happen this turn."
+        )
+        return ParsedTelegramText(
+            provider=agent,
+            message=f"{duration} {prompt}",
+            command="wake_add",
+        )
+
     # /wake — schedule a future ask.
     #
     #   /wake list                                 — list pending wakes

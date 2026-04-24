@@ -240,6 +240,7 @@ class TelegramDaemon:
                 {"command": "mcp", "description": "show MCP server status"},
                 {"command": "sessions", "description": "list Claude sessions"},
                 {"command": "wake", "description": "schedule a future ask (e.g. /wake 5m check BTC price)"},
+                {"command": "work", "description": "wake shortcut with work-first imperative (/work codex 30m)"},
                 {"command": "providers", "description": "list available providers"},
                 {"command": "help", "description": "show usage"},
             ])
@@ -518,6 +519,19 @@ class TelegramDaemon:
             return
         if parsed.command in ("wake_add", "wake_list", "wake_cancel", "wake_usage"):
             self._run_wake_command(parsed, chat_id, reply_to)
+            return
+        if parsed.command == "work_usage":
+            self._send_text(
+                chat_id,
+                "Usage:\n"
+                "  /work <duration> [hint]             — agent defaults to claude\n"
+                "  /work <agent> <duration> [hint]     — explicit agent\n\n"
+                "Like /wake but with a work-first imperative: the agent is told to make "
+                "real edits/tool calls/commits this turn, THEN report, THEN self-schedule "
+                "if not done. Prevents report-only lazy replies.\n\n"
+                "Example: /work codex 30m PR #29 mobile DOM",
+                reply_to_message_id=reply_to,
+            )
             return
         if not parsed.message:
             self._send_text(chat_id, "Empty message.", reply_to_message_id=reply_to)
