@@ -55,11 +55,46 @@ def parse_duration(s: str) -> int:
     return total
 
 
+def _main_worktree_for(path: Path) -> Path | None:
+    """If `path` is a git worktree (not the main checkout), return the
+    main worktree's path; otherwise None.
+
+    Detection: linked worktrees have `.git` as a *file* (plain text:
+    "gitdir: /abs/path/to/main/.git/worktrees/<name>"). The main
+    checkout has `.git` as a directory. We parse the pointer and walk
+    ../../.. to get the main repo root.
+    """
+    try:
+        git_pointer = path / ".git"
+        if not git_pointer.is_file():
+            return None
+        content = git_pointer.read_text(encoding="utf-8", errors="replace").strip()
+        if not content.startswith("gitdir:"):
+            return None
+        gitdir = Path(content.split(":", 1)[1].strip())
+        # gitdir looks like: /abs/main/.git/worktrees/<name>
+        # main root = gitdir.parent.parent.parent
+        main_git = gitdir.parent.parent  # .git
+        main_root = main_git.parent
+        if main_root.is_dir() and (main_root / ".git").is_dir():
+            return main_root
+    except Exception:
+        pass
+    return None
+
+
 def resolve_project_root() -> Path:
+    """Where the wake queue + CCB session files live.
+
+    Respects CCB_WORK_DIR. If the caller is inside a git worktree (not
+    the main checkout), resolves up to the main worktree — otherwise a
+    `wake add` from inside a worktree ends up in an orphan queue that
+    no askd scheduler watches (the askd is pinned to the main repo).
+    """
     wd = os.environ.get("CCB_WORK_DIR", "").strip()
-    if wd:
-        return Path(wd)
-    return Path.cwd()
+    base = Path(wd) if wd else Path.cwd()
+    main = _main_worktree_for(base)
+    return main if main else base
 
 
 def _resolve_caller(explicit: str) -> str:
