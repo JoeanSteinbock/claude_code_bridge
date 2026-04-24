@@ -161,20 +161,14 @@ def parse_message(text: str, default_provider: str) -> ParsedTelegramText:
             duration = parts[1].lower()
             hint = parts[2].strip() if len(parts) > 2 else ""
 
-        task = f" on {hint}" if hint else ""
-        prompt = (
-            f"Work{task} for this turn — make real edits / tool calls / commits (minimum 3 substantive actions). "
-            f"THEN post a concise progress report. "
-            f"THEN, if the task is not done, schedule another /work {agent} {duration}"
-            f"{' ' + hint if hint else ''} by calling "
-            f"`wake add {agent} --in {duration} --caller telegram --chat-id <this chat> "
-            f"\"{{same work prompt}}\"`. "
-            f"Do NOT reply with a report-only message — real work must happen this turn."
-        )
+        # Pass just the hint as the message and a `--work` flag; wake CLI
+        # expands to the full imperative so re-schedules via the same
+        # `wake add --work` command stay bit-identical across turns (no
+        # prompt drift).
         return ParsedTelegramText(
             provider=agent,
-            message=f"{duration} {prompt}",
-            command="wake_add",
+            message=f"{duration} {hint or '(continue your assigned tasks)'}",
+            command="work_add",
         )
 
     # /wake — schedule a future ask.

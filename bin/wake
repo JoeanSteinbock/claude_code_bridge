@@ -103,6 +103,36 @@ def cmd_add(args: argparse.Namespace) -> int:
         print("wake: message is required", file=sys.stderr)
         return 2
 
+    # Work-first template: applied BEFORE the telegram reminder so both
+    # compose correctly when both apply. The template is structured so
+    # the model, on re-scheduling, can just call
+    #   wake add <agent> --in <dur> --work --caller telegram --chat-id <id> "<same hint>"
+    # and the full imperative is reapplied each turn — no prompt drift.
+    if getattr(args, "work", False):
+        hint = message
+        agent_token = agent
+        dur_token = args.in_.strip()
+        chat_token = (args.chat_id or "").strip()
+        reschedule_cmd = (
+            f"wake add {agent_token} --in {dur_token} --work --caller telegram"
+            + (f" --chat-id {chat_token}" if chat_token else "")
+            + f" \"{hint}\""
+        )
+        message = (
+            f"Work on: {hint}\n\n"
+            f"In THIS turn you must:\n"
+            f"1. Do real work — make concrete edits, run tool calls, commit/push. "
+            f"Minimum 3 substantive actions on the codebase. No read-only browsing.\n"
+            f"2. Post a concise progress report summarizing what changed this turn "
+            f"(files touched, commits made, tests run).\n"
+            f"3. If the task is NOT done, self-reschedule by running this shell "
+            f"command verbatim:\n"
+            f"   {reschedule_cmd}\n"
+            f"4. If the task IS done, say so plainly and do not reschedule.\n\n"
+            f"Do not reply with a report-only message. Real work must happen "
+            f"before the report."
+        )
+
     caller = _resolve_caller(args.caller)
     project_root = resolve_project_root()
 
@@ -198,6 +228,12 @@ def _build_parser() -> argparse.ArgumentParser:
     add_p.add_argument("--in", dest="in_", required=True, metavar="DUR")
     add_p.add_argument("--caller", default="", help="terminal | telegram (auto-detected if omitted)")
     add_p.add_argument("--chat-id", dest="chat_id", default="")
+    add_p.add_argument(
+        "--work",
+        action="store_true",
+        help="Wrap the message in a work-first imperative template "
+             "(real edits/tool calls/commits THEN report THEN self-reschedule).",
+    )
     add_p.add_argument("message")
     add_p.set_defaults(func=cmd_add)
 

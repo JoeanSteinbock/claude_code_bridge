@@ -520,6 +520,9 @@ class TelegramDaemon:
         if parsed.command in ("wake_add", "wake_list", "wake_cancel", "wake_usage"):
             self._run_wake_command(parsed, chat_id, reply_to)
             return
+        if parsed.command == "work_add":
+            self._run_wake_command(parsed, chat_id, reply_to, work=True)
+            return
         if parsed.command == "work_usage":
             self._send_text(
                 chat_id,
@@ -988,7 +991,7 @@ class TelegramDaemon:
         self._send_text(chat_id, "Respawn:\n" + "\n".join(results),
                         reply_to_message_id=reply_to_message_id)
 
-    def _run_wake_command(self, parsed, chat_id: str, reply_to_message_id: int) -> None:
+    def _run_wake_command(self, parsed, chat_id: str, reply_to_message_id: int, *, work: bool = False) -> None:
         """Schedule / list / cancel wakes from Telegram.
 
         Shells out to the existing `wake` CLI instead of reimplementing
@@ -1069,9 +1072,13 @@ class TelegramDaemon:
                             reply_to_message_id=reply_to_message_id)
             return
         try:
+            cmd_args = [wake_cmd, "add", agent, "--in", duration,
+                        "--caller", "telegram", "--chat-id", str(chat_id)]
+            if work:
+                cmd_args.append("--work")
+            cmd_args.append(message)
             out = subprocess.run(
-                [wake_cmd, "add", agent, "--in", duration,
-                 "--caller", "telegram", "--chat-id", str(chat_id), message],
+                cmd_args,
                 cwd=self._work_dir(), env=env,
                 capture_output=True, text=True, timeout=15,
             )
