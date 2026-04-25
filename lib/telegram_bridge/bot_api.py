@@ -1,12 +1,33 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib import parse, request
 from urllib.error import HTTPError, URLError
+
+
+_BOLD_DOUBLE_RE = re.compile(r"\*\*([^*\n]+?)\*\*")
+_BOLD_DOUBLE_UNDERSCORE_RE = re.compile(r"__([^_\n]+?)__")
+
+
+def to_telegram_markdown(text: str) -> str:
+    """
+    Convert GitHub-flavored markdown (which models emit by default) into
+    Telegram legacy-Markdown — `**bold**` → `*bold*`, `__bold__` → `_bold_`.
+
+    Why: most providers are trained to emit `**bold**`. Telegram's legacy
+    Markdown parser uses single asterisks; without conversion replies show
+    raw `**` characters instead of formatting.
+    """
+    if not text:
+        return text
+    text = _BOLD_DOUBLE_RE.sub(r"*\1*", text)
+    text = _BOLD_DOUBLE_UNDERSCORE_RE.sub(r"_\1_", text)
+    return text
 
 
 @dataclass
@@ -114,14 +135,26 @@ class TelegramBotClient:
         return dest
 
     def send_message(self, chat_id: str | int, text: str, *, reply_to_message_id: int | None = None) -> dict[str, Any]:
+        original = text or ""
         payload: dict[str, Any] = {
             "chat_id": str(chat_id),
-            "text": text,
+            "text": to_telegram_markdown(original),
             "disable_web_page_preview": True,
+            "parse_mode": "Markdown",
         }
         if reply_to_message_id:
             payload["reply_to_message_id"] = int(reply_to_message_id)
-        return self._call("sendMessage", payload)
+        try:
+            return self._call("sendMessage", payload)
+        except TelegramApiError as exc:
+            msg = str(exc).lower()
+            if "parse" in msg or "entity" in msg or "can't find end" in msg:
+                # Unbalanced markup — retry as plain text so the message at
+                # least gets through.
+                payload.pop("parse_mode", None)
+                payload["text"] = original
+                return self._call("sendMessage", payload)
+            raise
 
     def _call(self, method: str, payload: dict[str, Any] | None = None) -> Any:
         url = f"{self.base_url}/{method}"
