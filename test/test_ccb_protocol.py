@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 
 from ccb_protocol import DONE_PREFIX, REQ_ID_PREFIX, is_done_text, make_req_id, strip_done_text, wrap_codex_prompt
-from ccb_protocol import strip_trailing_markers
+from ccb_protocol import normalize_ccb_markers, strip_trailing_markers
 
 
 def test_make_req_id_format_and_uniqueness() -> None:
@@ -65,3 +65,32 @@ def test_strip_trailing_markers_removes_done_and_harness_trailers() -> None:
     req_id = make_req_id()
     text = f"line1\nline2\n{DONE_PREFIX} {req_id}\nHARNESS_DONE\n\n"
     assert strip_trailing_markers(text) == "line1\nline2"
+
+
+def test_normalize_ccb_markers_splits_concatenated_markers() -> None:
+    a = "20260425-143545-214-334557-28"
+    b = "20260425-144001-786-334557-29"
+
+    # Two markers jammed onto one line — observed when MiniMax emits
+    # a CCB_DONE for one req plus a CCB_REQ_ID echo for the next.
+    raw = f"reply body\n{DONE_PREFIX} {a} {REQ_ID_PREFIX} {b}\n"
+    normalized = normalize_ccb_markers(raw)
+
+    assert is_done_text(normalized, a) is True
+    assert f"{REQ_ID_PREFIX} {b}" in normalized
+
+    # Already-normal text passes through untouched.
+    clean = f"hi\n{DONE_PREFIX} {a}\n"
+    assert normalize_ccb_markers(clean) == clean
+
+    # Empty / non-marker text is a no-op.
+    assert normalize_ccb_markers("") == ""
+    assert normalize_ccb_markers("just prose") == "just prose"
+
+    # Inline pair followed by another inline marker — three markers, one line.
+    c = "20260425-150000-000-334557-30"
+    crowded = f"{DONE_PREFIX} {a} {REQ_ID_PREFIX} {b} {DONE_PREFIX} {c}"
+    out = normalize_ccb_markers(crowded)
+    assert is_done_text(out, a) is True
+    assert is_done_text(out, c) is True
+    assert f"{REQ_ID_PREFIX} {b}" in out

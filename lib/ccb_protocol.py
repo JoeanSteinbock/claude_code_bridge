@@ -17,6 +17,37 @@ _TRAILING_DONE_TAG_RE = re.compile(
 )
 _ANY_CCB_DONE_LINE_RE = re.compile(r"^\s*CCB_DONE:\s*\d{8}-\d{6}-\d{3}-\d+-\d+\s*$")
 
+_CCB_MARKER_RE = re.compile(
+    r"CCB_(?:BEGIN|REQ_ID|DONE):\s*\d{8}-\d{6}-\d{3}-\d+-\d+"
+)
+
+
+def normalize_ccb_markers(text: str) -> str:
+    """
+    Ensure each CCB protocol marker (`CCB_BEGIN:`, `CCB_REQ_ID:`, `CCB_DONE:`)
+    sits on its own line. Some models — notably MiniMax via OpenCode under
+    rapid back-to-back prompts — concatenate two markers onto a single line
+    (e.g. `CCB_DONE: A CCB_REQ_ID: B`), which defeats the strict line-anchored
+    regexes in `is_done_text` and `extract_reply_for_req`.
+    Why: leaving the merged form alone causes the per-req reply correlation
+    to time out for every queued prompt after the first.
+    """
+    if not text or "CCB_" not in text:
+        return text
+    out: list[str] = []
+    pos = 0
+    for m in _CCB_MARKER_RE.finditer(text):
+        start = m.start()
+        line_start = text.rfind("\n", 0, start) + 1
+        prefix_on_line = text[line_start:start]
+        out.append(text[pos:start])
+        if prefix_on_line.strip():
+            out.append("\n")
+        out.append(m.group(0))
+        pos = m.end()
+    out.append(text[pos:])
+    return "".join(out)
+
 
 def _is_trailing_noise_line(line: str) -> bool:
     if (line or "").strip() == "":

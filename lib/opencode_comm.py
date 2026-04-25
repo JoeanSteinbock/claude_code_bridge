@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from ccb_protocol import REQ_ID_PREFIX
+from ccb_protocol import REQ_ID_PREFIX, normalize_ccb_markers
 from ccb_config import apply_backend_env
 from i18n import t
 from terminal import get_backend_for_session, get_pane_id_from_session
@@ -958,11 +958,11 @@ class OpenCodeLogReader:
         # Prefer final visible content when present.
         text = _collect({"text"})
         if text:
-            return text
+            return normalize_ccb_markers(text)
 
         # Fallback: some OpenCode runs only emit reasoning parts without a separate "text" part.
         if allow_reasoning_fallback:
-            return _collect({"reasoning"})
+            return normalize_ccb_markers(_collect({"reasoning"}))
         return ""
 
     def capture_state(self) -> Dict[str, Any]:
