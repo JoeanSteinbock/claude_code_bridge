@@ -13,6 +13,7 @@ from pathlib import Path
 from threading import Event, Lock, Thread
 from typing import Optional
 
+from . import _mount
 from .bot_api import TelegramApiError, TelegramBotClient, chunk_message
 from .config import SUPPORTED_PROVIDERS, TelegramConfig, get_config_dir, get_project_root, is_configured, load_config
 from .router import help_text, parse_message
@@ -63,6 +64,88 @@ def _provider_from_replied_to(reply_to_message: dict | None) -> str | None:
         return None
     candidate = m.group(1).lower()
     return candidate if candidate in SUPPORTED_PROVIDERS else None
+
+
+def _format_sender(user: dict | None) -> str:
+    """Render a Telegram User as `@username` or `First Last`."""
+    if not isinstance(user, dict):
+        return ""
+    username = (user.get("username") or "").strip()
+    if username:
+        return f"@{username}"
+    first = (user.get("first_name") or "").strip()
+    last = (user.get("last_name") or "").strip()
+    name = f"{first} {last}".strip()
+    return name or ""
+
+
+def _format_origin(origin: dict | None) -> str:
+    """Render a MessageOrigin (forward_origin / external_reply.origin)."""
+    if not isinstance(origin, dict):
+        return ""
+    otype = (origin.get("type") or "").strip()
+    if otype == "user":
+        return _format_sender(origin.get("sender_user"))
+    if otype == "hidden_user":
+        return (origin.get("sender_user_name") or "").strip()
+    if otype in ("chat", "channel"):
+        chat = origin.get("sender_chat") or origin.get("chat") or {}
+        username = (chat.get("username") or "").strip()
+        if username:
+            return f"@{username}"
+        return (chat.get("title") or "").strip() or otype
+    return ""
+
+
+def _extract_reply_context(msg: dict) -> str:
+    """Build a header describing the reply / quote / forward context so
+    the model sees the conversational frame the user is responding to.
+    Telegram only puts the user's own text in `msg.text`; the message
+    they're replying to or quoting lives in sibling fields and is
+    invisible to the provider unless we surface it explicitly."""
+    if not isinstance(msg, dict):
+        return ""
+    parts: list[str] = []
+
+    # Whole-message forward — `msg.text` already carries the body, so
+    # we only need to annotate the source.
+    fwd = msg.get("forward_origin")
+    if isinstance(fwd, dict):
+        src = _format_origin(fwd) or "unknown"
+        parts.append(f"[forwarded from {src}]")
+
+    # Quote-reply: a snippet from the replied message that the user
+    # explicitly highlighted (Telegram 2023+ "reply with quote").
+    quote = msg.get("quote")
+    quote_text = ""
+    if isinstance(quote, dict):
+        quote_text = (quote.get("text") or "").strip()
+        if quote_text:
+            parts.append(f"[quoted snippet] {quote_text}")
+
+    # Same-chat reply. If a quote snippet was provided, the full body
+    # would just be noise — keep the attribution but skip the body.
+    rtm = msg.get("reply_to_message")
+    if isinstance(rtm, dict):
+        sender = _format_sender(rtm.get("from")) or "someone"
+        body = (rtm.get("text") or rtm.get("caption") or "").strip()
+        if quote_text:
+            parts.append(f"[replying to {sender}]")
+        elif body:
+            parts.append(f"[replying to {sender}] {body}")
+
+    # Cross-chat reply (newer Telegram feature). `external_reply` carries
+    # an origin + optional content snippet from the other chat.
+    ext = msg.get("external_reply")
+    if isinstance(ext, dict):
+        src = _format_origin(ext.get("origin")) or "another chat"
+        body = (ext.get("text") or "").strip()
+        if body:
+            parts.append(f"[replying to {src}] {body}")
+        else:
+            parts.append(f"[replying to {src}]")
+
+    return "\n".join(parts)
 
 
 @dataclass
@@ -202,6 +285,12 @@ class TelegramDaemon:
         self._chat_queues: dict[tuple[str, str], list[dict]] = {}
         self._chat_busy: dict[tuple[str, str], bool] = {}
         self._chat_state_lock = Lock()
+        # /mount: per-process registry of clone-done flags keyed by
+        # suggested_username. Persisted state lives in pending_mounts.json;
+        # this dict only tracks the threading.Event for the corresponding
+        # background clone. Empty until the first /mount or until
+        # _mount.recover_pending repopulates it at startup.
+        self._clone_events: dict[str, Event] = {}
 
     def start(self) -> None:
         me = self.client.get_me()
@@ -241,6 +330,7 @@ class TelegramDaemon:
                 {"command": "sessions", "description": "list Claude sessions"},
                 {"command": "wake", "description": "schedule a future ask (e.g. /wake 5m check BTC price)"},
                 {"command": "work", "description": "wake shortcut with work-first imperative (/work codex 30m)"},
+                {"command": "mount", "description": "clone a repo + spawn a dedicated bot (manager only)"},
                 {"command": "providers", "description": "list available providers"},
                 {"command": "help", "description": "show usage"},
             ])
@@ -248,11 +338,34 @@ class TelegramDaemon:
             _write_log(f"[telegramd] setMyCommands failed: {exc}", self.project_root)
 
         _write_log(f"[telegramd] started pid={self.state.pid} bot=@{username or 'unknown'}", self.project_root)
+
+        # Re-hydrate /mount in-flight state. Must run before the polling
+        # loop so any `update["managed_bot"]` arriving on the first poll
+        # finds the threading.Event already registered.
+        try:
+            _mount.recover_pending(self, self.project_root)
+        except Exception as exc:
+            _write_log(f"[telegramd] mount recovery failed: {exc}", self.project_root)
+
         while not self.stop_event.is_set():
             try:
                 updates = self.client.get_updates(
                     offset=(self.state.last_update_id + 1) if self.state.last_update_id else None,
                     timeout=self.config.long_poll_timeout_seconds,
+                    # Explicit list — Telegram treats `allowed_updates` as
+                    # a hard filter, so we must enumerate all currently-
+                    # received types plus `managed_bot` (the new opt-in
+                    # type from the Managed Bots feature). Daemon today
+                    # only dispatches `message` and `managed_bot`, but we
+                    # include the others defensively for forward compat.
+                    allowed_updates=[
+                        "message",
+                        "edited_message",
+                        "channel_post",
+                        "edited_channel_post",
+                        "callback_query",
+                        "managed_bot",
+                    ],
                 )
                 if not updates:
                     time.sleep(self.config.polling_interval_seconds)
@@ -413,6 +526,17 @@ class TelegramDaemon:
             self.state.last_update_id = update_id
             write_daemon_state(self.state, self.project_root)
 
+        # Managed-bots (the bot creation flow): a `managed_bot` update
+        # arrives whenever a user taps a `t.me/newbot/<self>/...` link
+        # we sent and completes the 1-tap creation. See `/mount`.
+        mb = update.get("managed_bot")
+        if isinstance(mb, dict):
+            try:
+                self._handle_managed_bot(mb)
+            except Exception as exc:
+                _write_log(f"[telegramd] managed_bot handler error: {exc}", self.project_root)
+            return
+
         msg = update.get("message")
         if not isinstance(msg, dict):
             return
@@ -433,6 +557,16 @@ class TelegramDaemon:
 
         # Text, or caption that accompanies a media attachment.
         text = str(msg.get("text", "") or msg.get("caption", "") or "").strip()
+
+        # Surface reply / quote / forward context. Telegram puts only
+        # the user's own typing in `text`; anything they're replying to
+        # or quoting lives in sibling fields and is otherwise invisible
+        # to the provider. Skip for slash commands so command parsing
+        # isn't disturbed.
+        if text and not text.startswith("/"):
+            reply_ctx = _extract_reply_context(msg)
+            if reply_ctx:
+                text = f"{reply_ctx}\n\n{text}"
 
         # Detect and download any attachments. Voice/audio get transcribed
         # via whisper-cli so the provider sees the actual spoken text.
@@ -525,6 +659,9 @@ class TelegramDaemon:
             return
         if parsed.command == "work_add":
             self._run_wake_command(parsed, chat_id, reply_to, work=True)
+            return
+        if parsed.command in ("mount_add", "mount_usage"):
+            self._run_mount_command(parsed, chat_id, reply_to)
             return
         if parsed.command == "work_usage":
             self._send_text(
@@ -1100,6 +1237,178 @@ class TelegramDaemon:
             f"⏰ Wake scheduled: `{wake_id}`\n"
             f"{agent} in {duration} → will reply here when it fires.",
             reply_to_message_id=reply_to_message_id,
+        )
+
+    # ------------------------------------------------------------------
+    # /mount — clone repo + spawn dedicated bot.
+    # See `_mount.py` for helpers and the recovery dance on daemon
+    # restart. The slash handler MUST persist pending state and register
+    # the in-memory Event BEFORE starting the clone thread or sending
+    # the inline keyboard, otherwise a fast user tap can race the JSON
+    # write and `_handle_managed_bot` fails to find the entry.
+    # ------------------------------------------------------------------
+
+    def _run_mount_command(self, parsed, chat_id: str, reply_to_message_id: int) -> None:
+        if parsed.command == "mount_usage":
+            self._send_text(
+                chat_id,
+                "Usage: `/mount <git-url>`\n"
+                "Supported: github.com / gitlab.com / bitbucket.org (https or ssh).",
+                reply_to_message_id=reply_to_message_id,
+            )
+            return
+
+        url = (parsed.message or "").strip()
+        parsed_url = _mount.parse_repo_url(url)
+        if not parsed_url:
+            self._send_text(
+                chat_id,
+                "URL must be github.com / gitlab.com / bitbucket.org (https or ssh).",
+                reply_to_message_id=reply_to_message_id,
+            )
+            return
+        owner, repo = parsed_url
+        target = _mount.target_path(owner, repo)
+        suggested = _mount.suggested_username(owner, repo)
+        manager_username = (self.state.bot_username or "").strip()
+        if not manager_username:
+            self._send_text(
+                chat_id,
+                "Manager bot username unknown — can't build deep link. Try again in a moment.",
+                reply_to_message_id=reply_to_message_id,
+            )
+            return
+
+        # ORDER MATTERS: persist pending + register Event BEFORE clone
+        # thread spawn and BEFORE sending the keyboard, so a fast tap
+        # can never race ahead of the JSON write.
+        _mount.add_pending(self.project_root, suggested, chat_id, str(target), url)
+        done_event = Event()
+        self._clone_events[suggested] = done_event
+
+        Thread(
+            target=self._clone_repo_bg,
+            args=(url, target, suggested, done_event),
+            daemon=True,
+            name=f"ccb-mount-clone-{suggested}",
+        ).start()
+
+        button_url = (
+            f"https://t.me/newbot/{manager_username}/{suggested}"
+            f"?name={owner}/{repo}"
+        )
+        # Telegram's Markdown can't render `@` plus underscore-heavy
+        # bot names cleanly inside a link, so the body stays terse and
+        # the URL lives in the inline button.
+        self.client.send_message_with_url_button(
+            chat_id,
+            f"📦 Cloning `{owner}/{repo}` → `{target}`.\n"
+            f"Tap below to create `@{suggested}`. Once it's live, "
+            "I'll wire it up automatically.",
+            button_text=f"Create @{suggested}",
+            button_url=button_url,
+            reply_to_message_id=reply_to_message_id,
+        )
+
+    def _clone_repo_bg(
+        self,
+        url: str,
+        target: Path,
+        suggested: str,
+        done_event: Event,
+    ) -> None:
+        """Run `git clone` (or fetch) off the polling thread. Always
+        sets `done_event` so `_handle_managed_bot` unblocks even on
+        clone failure — error reporting happens at handoff time."""
+        try:
+            ok, msg = _mount.clone_repo(url, target)
+            _write_log(
+                f"[telegramd] mount clone {suggested}: {'ok' if ok else 'FAIL'} {msg}",
+                self.project_root,
+            )
+        finally:
+            done_event.set()
+
+    def _handle_managed_bot(self, mb: dict) -> None:
+        bot = mb.get("bot") or {}
+        bot_id = int(bot.get("id") or 0)
+        bot_username = (bot.get("username") or "").lower()
+        if not (bot_id and bot_username):
+            _write_log(
+                f"[telegramd] managed_bot missing bot.id or bot.username: {mb!r}",
+                self.project_root,
+            )
+            return
+
+        pending = _mount.pop_pending(self.project_root, bot_username)
+        if not pending:
+            # Could be a bot we already processed, or the user picked a
+            # different username than we suggested. Log + bail.
+            _write_log(
+                f"[telegramd] managed_bot for unknown @{bot_username} (id={bot_id}); ignoring",
+                self.project_root,
+            )
+            return
+
+        chat_id = pending.get("chat_id", "")
+        target = pending.get("target", "")
+
+        ev = self._clone_events.get(bot_username)
+        if ev is not None and not ev.wait(timeout=60):
+            self._send_text(
+                chat_id,
+                f"⏳ Clone for @{bot_username} still running after 60s — "
+                "will keep going in the background. Re-tap the button "
+                "to retry once it's done.",
+            )
+            # Re-add so the next tap finds the entry.
+            _mount.add_pending(
+                self.project_root, bot_username, chat_id, target, pending.get("url", "")
+            )
+            return
+
+        try:
+            token = self.client.get_managed_bot_token(user_id=bot_id)
+        except TelegramApiError as exc:
+            # Log bot.id explicitly so a future /mount-recover can use it
+            # without scraping the Telegram side.
+            _write_log(
+                f"[telegramd] getManagedBotToken failed for @{bot_username} "
+                f"(bot_id={bot_id}, chat={chat_id}): {exc}",
+                self.project_root,
+            )
+            self._send_text(
+                chat_id,
+                f"❌ Token fetch for @{bot_username} failed: {exc}\n"
+                f"Bot exists on Telegram (id={bot_id}); manual recovery in Phase 2.",
+            )
+            return
+
+        if not token:
+            self._send_text(
+                chat_id,
+                f"❌ getManagedBotToken returned empty for @{bot_username} (id={bot_id}).",
+            )
+            return
+
+        try:
+            rc = subprocess.run(
+                ["ccb", "mount", target, "--bot-token", token, "--chat-id", str(chat_id)],
+                capture_output=True, text=True, timeout=120,
+            )
+        except Exception as exc:
+            self._send_text(chat_id, f"❌ `ccb mount` spawn failed: {exc}")
+            return
+
+        if rc.returncode != 0:
+            err = (rc.stderr or rc.stdout or "").strip() or f"rc={rc.returncode}"
+            self._send_text(chat_id, f"❌ `ccb mount` failed:\n```\n{err[:1500]}\n```")
+            return
+
+        self._send_text(
+            chat_id,
+            f"✅ @{bot_username} live at `{target}`.\n"
+            f"DM it to start working in that project.",
         )
 
     def _run_tail_command(

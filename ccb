@@ -53,8 +53,8 @@ if backend_env and not os.environ.get("CCB_BACKEND_ENV"):
     os.environ["CCB_BACKEND_ENV"] = backend_env
 
 VERSION = "5.2.9"
-GIT_COMMIT = "2bb9a1b"
-GIT_DATE = "2026-04-05"
+GIT_COMMIT = "f7131d6"
+GIT_DATE = "2026-04-25"
 
 _WIN_DRIVE_RE = re.compile(r"^[A-Za-z]:([/\\\\]|$)")
 _MNT_DRIVE_RE = re.compile(r"^/mnt/([A-Za-z])/(.*)$")
@@ -5327,6 +5327,90 @@ def cmd_telegram(argv: list[str]) -> int:
     return 1
 
 
+def cmd_mount(argv: list[str]) -> int:
+    """Boot a fresh CCB project from a path + bot token. Called by the
+    manager bot's `/mount` flow once the new bot has been created and
+    its token retrieved via `getManagedBotToken`. Idempotent on the
+    config/tmux side: if the tmux session is already up, refuses
+    (no double-spawn) — the caller decides whether to teardown first.
+    """
+    parser = argparse.ArgumentParser(prog="ccb mount", description="Boot a CCB project from path + bot token")
+    parser.add_argument("path", help="Project path (must be a git repo)")
+    parser.add_argument("--bot-token", required=True, help="Telegram bot token for the new project's bot")
+    parser.add_argument("--chat-id", required=True, help="Allowed Telegram chat ID")
+    parser.add_argument("--default-provider", default="claude", help="Default provider for the project (default: claude)")
+    parser.add_argument("--session-name", default="", help="tmux session name (default: derived from path)")
+    args = parser.parse_args(argv)
+
+    target = Path(args.path).expanduser().resolve()
+    if not target.is_dir():
+        print(f"❌ {target} is not a directory", file=sys.stderr)
+        return 1
+    if not (target / ".git").exists():
+        print(f"❌ {target} is not a git repository", file=sys.stderr)
+        return 1
+
+    # Write .ccb/ccb.config. Match the structure used by existing
+    # projects (see ~/projects/xbtoshi/polymarket-5m-maker/.ccb/ccb.config).
+    cfg_dir = target / ".ccb"
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    cfg_path = cfg_dir / "ccb.config"
+    cfg = {
+        "providers": ["codex", "opencode", "claude"],
+        "flags": {"auto": True, "resume": True, "replace_existing": True},
+        "telegram": {
+            "enabled": True,
+            "bot_token": args.bot_token,
+            "allowed_chat_ids": [str(args.chat_id)],
+            "default_provider": args.default_provider,
+            "default_work_dir": ".",
+            "broadcast_providers": ["claude", "codex", "gemini", "opencode"],
+        },
+    }
+    cfg_path.write_text(json.dumps(cfg, indent=2))
+
+    # Decide tmux session name. Default = sanitized path basename.
+    session_name = (args.session_name or "").strip()
+    if not session_name:
+        session_name = re.sub(r"[^a-zA-Z0-9_-]", "_", target.name) or "ccb"
+
+    # Refuse to clobber an existing tmux session with the same name.
+    rc = subprocess.run(["tmux", "has-session", "-t", session_name],
+                        capture_output=True, text=True)
+    if rc.returncode == 0:
+        print(f"❌ tmux session '{session_name}' already exists; refusing to clobber",
+              file=sys.stderr)
+        return 1
+
+    # Spawn detached tmux session running ccb. ccb itself wires up the
+    # 4-pane layout and starts the providers.
+    rc = subprocess.run(
+        ["tmux", "new-session", "-d", "-s", session_name, "-c", str(target),
+         "ccb", "-a", "-r"],
+        capture_output=True, text=True,
+    )
+    if rc.returncode != 0:
+        err = (rc.stderr or rc.stdout or "").strip() or f"rc={rc.returncode}"
+        print(f"❌ tmux new-session failed: {err}", file=sys.stderr)
+        return 1
+
+    # Give ccb a few seconds to initialize before starting telegramd —
+    # otherwise the daemon races the session-file writes inside ccb.
+    time.sleep(3)
+
+    rc = subprocess.run(
+        ["ccb", "telegram", "start"],
+        cwd=str(target), capture_output=True, text=True, timeout=30,
+    )
+    if rc.returncode != 0:
+        err = (rc.stderr or rc.stdout or "").strip() or f"rc={rc.returncode}"
+        print(f"⚠️ telegramd start failed: {err}", file=sys.stderr)
+        # Don't bail — tmux session is up and the user can debug from there.
+
+    print(f"✅ Mounted {target.name} → tmux session '{session_name}'")
+    return 0
+
+
 def cmd_droid_subcommand(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="ccb droid", description="Droid-specific commands")
     subparsers = parser.add_subparsers(dest="subcommand", help="Droid subcommands")
@@ -5400,6 +5484,11 @@ def main():
     # Handle 'ccb telegram' subcommand
     if argv and argv[0] == "telegram":
         return cmd_telegram(argv[1:])
+
+    # Handle 'ccb mount' — boot a fresh project given a path + bot token.
+    # Used by the manager bot's `/mount` Telegram flow.
+    if argv and argv[0] == "mount":
+        return cmd_mount(argv[1:])
 
     start_parser = argparse.ArgumentParser(
         description="Claude AI unified launcher",

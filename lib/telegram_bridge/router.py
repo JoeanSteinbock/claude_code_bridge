@@ -219,6 +219,15 @@ def parse_message(text: str, default_provider: str) -> ParsedTelegramText:
                                       command="wake_add")
         return ParsedTelegramText(provider=None, message="", command="wake_usage")
 
+    # /mount <git-url> — clone repo + spawn dedicated bot for the project.
+    # Owned by the manager bot (mate404_bot). Only the URL form is wired
+    # up in MVP; /mount /local/path is Phase 2.
+    if lowered == "/mount" or lowered.startswith("/mount "):
+        body = raw[6:].strip() if len(raw) > 6 else ""
+        if not body:
+            return ParsedTelegramText(provider=None, message="", command="mount_usage")
+        return ParsedTelegramText(provider=None, message=body, command="mount_add")
+
     if lowered.startswith("/ask "):
         parts = raw.split(None, 2)
         if len(parts) >= 3:
@@ -302,6 +311,7 @@ def help_text(default_provider: str, broadcast_providers: list[str]) -> str:
         "  /help\n"
         "  /providers\n"
         "  /new <provider> — reset that provider's session (or `all`)\n"
-        "  /reset <provider> — alias for /new"
+        "  /reset <provider> — alias for /new\n"
+        "  /mount <git-url> — clone repo + spawn dedicated bot (manager only)"
     )
 

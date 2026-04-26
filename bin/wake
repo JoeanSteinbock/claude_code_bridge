@@ -229,6 +229,20 @@ def cmd_add(args: argparse.Namespace) -> int:
     return 0
 
 
+def _wake_title(message: str, width: int = 80) -> str:
+    """Strip the `[wake trigger] ...` boilerplate that wake itself
+    prepends for telegram callers, then collapse whitespace so each
+    queue row shows the actual task on one line. Without this every
+    telegram-caller wake looks identical in the list."""
+    body = (message or "").strip()
+    if body.startswith("[wake trigger]"):
+        _, sep, rest = body.partition("\n\n")
+        if sep and rest.strip():
+            body = rest.strip()
+    body = " ".join(body.split())
+    return body[:width]
+
+
 def cmd_list(args: argparse.Namespace) -> int:
     project_root = resolve_project_root()
     q = wake_queue.load(project_root)
@@ -239,7 +253,7 @@ def cmd_list(args: argparse.Namespace) -> int:
         fires_in = float(e.get("fire_at", 0)) - now
         when = f"{int(fires_in)}s" if fires_in >= 0 else "overdue"
         print(f"{e.get('wake_id')}\t{e.get('agent')}\t{when}\t{e.get('caller','')}"
-              f"\t{e.get('chat_id','')}\t{e.get('message','')[:80]}")
+              f"\t{e.get('chat_id','')}\t{_wake_title(e.get('message',''))}")
     return 0
 
 

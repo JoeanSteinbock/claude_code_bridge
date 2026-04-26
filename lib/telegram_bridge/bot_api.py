@@ -82,14 +82,36 @@ class TelegramBotClient:
             },
         )
 
-    def get_updates(self, *, offset: int | None = None, timeout: int = 30) -> list[dict[str, Any]]:
+    def get_updates(
+        self,
+        *,
+        offset: int | None = None,
+        timeout: int = 30,
+        allowed_updates: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
         payload: dict[str, Any] = {"timeout": int(timeout)}
         if offset is not None:
             payload["offset"] = int(offset)
+        if allowed_updates is not None:
+            # Telegram defaults to "all except a few opt-in types" when the
+            # field is omitted. Pass it explicitly when we need to opt in
+            # to newer types like `managed_bot`. Caller must enumerate
+            # everything they still want — Telegram treats this list as a
+            # hard filter, not an extension.
+            payload["allowed_updates"] = list(allowed_updates)
         result = self._call("getUpdates", payload)
         if isinstance(result, list):
             return result
         return []
+
+    def get_managed_bot_token(self, *, user_id: int) -> str:
+        """Fetch the bot token for a managed bot we own. `user_id` is the
+        managed bot's Telegram User ID (from `update["managed_bot"].bot.id`).
+        Empirically: Telegram's API responds 400 BOT_ACCESS_FORBIDDEN if
+        we don't actually own the bot, and 400 'user not found' for an
+        unknown id."""
+        result = self._call("getManagedBotToken", {"user_id": int(user_id)})
+        return str(result) if result else ""
 
     def send_chat_action(self, chat_id: str | int, action: str = "typing") -> dict[str, Any]:
         # Telegram shows the "…is typing" status for ~5 seconds; callers must
@@ -153,6 +175,39 @@ class TelegramBotClient:
                 # least gets through.
                 payload.pop("parse_mode", None)
                 payload["text"] = original
+                return self._call("sendMessage", payload)
+            raise
+
+    def send_message_with_url_button(
+        self,
+        chat_id: str | int,
+        text: str,
+        *,
+        button_text: str,
+        button_url: str,
+        reply_to_message_id: int | None = None,
+    ) -> dict[str, Any]:
+        """sendMessage with a single URL button (inline keyboard).
+        Used by /mount to surface the t.me/newbot deep link as a tap
+        target instead of a bare URL."""
+        payload: dict[str, Any] = {
+            "chat_id": str(chat_id),
+            "text": to_telegram_markdown(text or ""),
+            "disable_web_page_preview": True,
+            "parse_mode": "Markdown",
+            "reply_markup": {
+                "inline_keyboard": [[{"text": button_text, "url": button_url}]]
+            },
+        }
+        if reply_to_message_id:
+            payload["reply_to_message_id"] = int(reply_to_message_id)
+        try:
+            return self._call("sendMessage", payload)
+        except TelegramApiError as exc:
+            msg = str(exc).lower()
+            if "parse" in msg or "entity" in msg or "can't find end" in msg:
+                payload.pop("parse_mode", None)
+                payload["text"] = text or ""
                 return self._call("sendMessage", payload)
             raise
 
