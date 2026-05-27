@@ -2,7 +2,7 @@
 """
 askd - Unified Ask Daemon for all AI providers.
 
-Single daemon process handling codex, gemini, opencode, droid, claude, copilot, codebuddy, and qwen.
+Single daemon process handling codex, gemini, opencode, droid, claude, copilot, codebuddy, qwen, and grok.
 """
 from __future__ import annotations
 
@@ -29,6 +29,7 @@ from askd.adapters.claude import ClaudeAdapter
 from askd.adapters.copilot import CopilotAdapter
 from askd.adapters.codebuddy import CodebuddyAdapter
 from askd.adapters.qwen import QwenAdapter
+from askd.adapters.grok import GrokAdapter
 
 
 def _parse_listen(value: str) -> tuple[str, int]:
@@ -41,7 +42,7 @@ def _parse_listen(value: str) -> tuple[str, int]:
     return host or "127.0.0.1", int(port_s or "0")
 
 
-ALL_PROVIDERS = ["codex", "gemini", "opencode", "droid", "claude", "copilot", "codebuddy", "qwen"]
+ALL_PROVIDERS = ["codex", "gemini", "opencode", "droid", "claude", "copilot", "codebuddy", "qwen", "grok"]
 
 ADAPTER_CLASSES = {
     "codex": CodexAdapter,
@@ -52,6 +53,7 @@ ADAPTER_CLASSES = {
     "copilot": CopilotAdapter,
     "codebuddy": CodebuddyAdapter,
     "qwen": QwenAdapter,
+    "grok": GrokAdapter,
 }
 
 

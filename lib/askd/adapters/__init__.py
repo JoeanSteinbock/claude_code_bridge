@@ -16,4 +16,5 @@ __all__ = [
     "CopilotAdapter",
     "CodebuddyAdapter",
     "QwenAdapter",
+    "GrokAdapter",
 ]

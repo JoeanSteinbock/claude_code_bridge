@@ -203,6 +203,28 @@ QASK_CLIENT_SPEC = ProviderClientSpec(
 )
 
 
+# ── Grok (xAI Grok Build CLI) ────────────────────────────────────────────────
+RASKD_SPEC = ProviderDaemonSpec(
+    daemon_key="raskd",
+    protocol_prefix="rask",
+    state_file_name="raskd.json",
+    log_file_name="raskd.log",
+    idle_timeout_env="CCB_RASKD_IDLE_TIMEOUT_S",
+    lock_name="raskd",
+)
+
+RASK_CLIENT_SPEC = ProviderClientSpec(
+    protocol_prefix="rask",
+    enabled_env="CCB_RASKD",
+    autostart_env_primary="CCB_RASKD_AUTOSTART",
+    autostart_env_legacy="CCB_AUTO_RASKD",
+    state_file_env="CCB_RASKD_STATE_FILE",
+    session_filename=".grok-session",
+    daemon_bin_name="askd",
+    daemon_module="askd.daemon",
+)
+
+
 # ── Multi-instance provider utilities ────────────────────────────────────────
 
 

@@ -40,7 +40,7 @@ from session_utils import (
 )
 from pane_registry import upsert_registry, load_registry_by_project_id
 from project_id import compute_ccb_project_id
-from providers import CASK_CLIENT_SPEC, GASK_CLIENT_SPEC, OASK_CLIENT_SPEC, LASK_CLIENT_SPEC, DASK_CLIENT_SPEC
+from providers import CASK_CLIENT_SPEC, GASK_CLIENT_SPEC, OASK_CLIENT_SPEC, LASK_CLIENT_SPEC, DASK_CLIENT_SPEC, RASK_CLIENT_SPEC
 from process_lock import ProviderLock
 from askd_rpc import shutdown_daemon, read_state
 from askd_runtime import state_file_path
@@ -603,6 +603,15 @@ class AILauncher:
         env = {
             "CCB_MANAGED": "1",
             "CCB_PARENT_PID": str(self.ccb_pid),
+            # Pin the wake / ask client target to this CCB session's project
+            # root, independent of where the agent's `cwd` ends up. Without
+            # this, `wake claude ...` issued by an agent that cd'd to another
+            # project queues into THAT project's `.ccb/wake_queue.json` —
+            # orphaning the wake if no askd is watching there. Observed
+            # 2026-05-23: 59 wakes piled up in xbtoshi/directory because the
+            # kyc-rip Claude was editing files there before scheduling its
+            # next turn. CCB_WORK_DIR is consulted by `bin/wake` and `bin/ask`.
+            "CCB_WORK_DIR": str(self.project_root),
         }
         if os.environ.get("CCB_RUN_DIR"):
             env["CCB_RUN_DIR"] = os.environ["CCB_RUN_DIR"]
@@ -612,7 +621,7 @@ class AILauncher:
         """Managed env + explicit caller marker for the pane/provider process."""
         env = self._managed_env_overrides()
         prov = (provider or "").strip().lower()
-        if prov in {"claude", "codex", "gemini", "opencode", "droid", "email", "manual"}:
+        if prov in {"claude", "codex", "gemini", "opencode", "droid", "grok", "email", "manual"}:
             env["CCB_CALLER"] = prov
         # Many provider CLIs use `update-notifier` (npm pkg) which can pop a
         # "new version available — update?" prompt on startup. That prompt
@@ -647,7 +656,7 @@ class AILauncher:
         if not cfg.is_dir():
             return
 
-        for name in (".codex-session", ".gemini-session", ".opencode-session", ".claude-session", ".droid-session"):
+        for name in (".codex-session", ".gemini-session", ".opencode-session", ".claude-session", ".droid-session", ".grok-session"):
             legacy = self.project_root / name
             if not legacy.exists():
                 continue
@@ -830,7 +839,7 @@ class AILauncher:
     def _maybe_start_unified_askd(self, *, quiet: bool = False) -> None:
         """Start unified askd daemon (provider-agnostic)."""
         # Try to start for any enabled provider that uses askd (including claude)
-        for provider in ["codex", "gemini", "opencode", "droid", "claude"]:
+        for provider in ["codex", "gemini", "opencode", "droid", "claude", "grok"]:
             if provider in [p.lower() for p in self.providers]:
                 # Try to start and check if successful
                 self._maybe_start_provider_daemon(provider, quiet=quiet)
@@ -908,6 +917,7 @@ class AILauncher:
             "opencode": OASK_CLIENT_SPEC,
             "claude": LASK_CLIENT_SPEC,
             "droid": DASK_CLIENT_SPEC,
+            "grok": RASK_CLIENT_SPEC,
         }
         spec = specs.get(provider)
         if not spec:
@@ -1336,6 +1346,8 @@ class AILauncher:
             return self._start_opencode_tmux(parent_pane=parent_pane, direction=direction)
         elif provider == "droid":
             return self._start_droid_tmux(parent_pane=parent_pane, direction=direction)
+        elif provider == "grok":
+            return self._start_grok_tmux(parent_pane=parent_pane, direction=direction)
         else:
             print(f"❌ {t('unknown_provider', provider=provider)}")
             return None
@@ -1389,6 +1401,8 @@ class AILauncher:
             self._write_opencode_session(runtime, None, pane_id=pane_id, pane_title_marker=pane_title_marker, start_cmd=start_cmd)
         elif provider == "droid":
             self._write_droid_session(runtime, None, pane_id=pane_id, pane_title_marker=pane_title_marker, start_cmd=start_cmd)
+        elif provider == "grok":
+            self._write_grok_session(runtime, None, pane_id=pane_id, pane_title_marker=pane_title_marker, start_cmd=start_cmd)
         else:
             print(f"❌ {t('unknown_provider', provider=provider)}")
             return None
@@ -2019,6 +2033,8 @@ class AILauncher:
             cmd = self._build_opencode_start_cmd()
         elif provider == "droid":
             cmd = self._build_droid_start_cmd()
+        elif provider == "grok":
+            cmd = self._build_grok_start_cmd()
         else:
             cmd = ""
         # Append per-provider launch_args from config.
@@ -2152,6 +2168,15 @@ class AILauncher:
             else:
                 print(f"ℹ️ {t('no_history_fresh', provider='OpenCode')}")
 
+        return cmd
+
+    def _build_grok_start_cmd(self) -> str:
+        # Grok Build CLI (xAI). Claude-Code-shaped TUI. Allow env override for custom wrappers.
+        cmd = (os.environ.get("GROK_START_CMD") or "grok").strip() or "grok"
+        # Resume mode: --continue (parity with claude/opencode). Grok CLI accepts -c / --continue.
+        if self.resume:
+            cmd = f"{cmd} --continue"
+            print(f"🔁 {t('resuming_session', provider='Grok', session_id='')}")
         return cmd
 
     def _get_latest_droid_session_id(self) -> tuple[str | None, bool, Path | None]:
@@ -2440,6 +2465,58 @@ class AILauncher:
         )
 
         print(f"✅ {t('started_backend', provider='OpenCode', terminal='tmux pane', pane_id=pane_id)}")
+        return pane_id
+
+    def _start_grok_tmux(
+        self,
+        *,
+        parent_pane: str | None = None,
+        direction: str | None = None,
+    ) -> str | None:
+        runtime = self.runtime_dir / "grok"
+        runtime.mkdir(parents=True, exist_ok=True)
+
+        env_overrides = self._provider_env_overrides("grok")
+        start_cmd = self._build_env_prefix(env_overrides) + _build_export_path_cmd(self.script_dir / "bin") + self._build_grok_start_cmd()
+        pane_title_marker = f"CCB-Grok-{self.project_id[:8]}"
+
+        backend = TmuxBackend()
+
+        use_direction = (direction or ("right" if not self.tmux_panes else "bottom")).strip() or "right"
+        use_parent = parent_pane
+        if not use_parent:
+            try:
+                use_parent = backend.get_current_pane_id()
+            except Exception:
+                use_parent = None
+        if not use_parent and use_direction == "bottom":
+            try:
+                use_parent = next(reversed(self.tmux_panes.values()))
+            except StopIteration:
+                use_parent = None
+
+        try:
+            if use_parent and str(use_parent).startswith("%") and not backend.pane_exists(str(use_parent)):
+                use_parent = backend.get_current_pane_id()
+        except Exception:
+            use_parent = None
+
+        pane_id = backend.create_pane("", str(Path.cwd()), direction=use_direction, percent=50, parent_pane=use_parent)
+        backend.respawn_pane(pane_id, cmd=start_cmd, cwd=str(Path.cwd()), remain_on_exit=True)
+        backend.set_pane_title(pane_id, pane_title_marker)
+        backend.set_pane_user_option(pane_id, "@ccb_agent", "Grok")
+
+        self.tmux_panes["grok"] = pane_id
+
+        self._write_grok_session(
+            runtime,
+            None,
+            pane_id=pane_id,
+            pane_title_marker=pane_title_marker,
+            start_cmd=start_cmd,
+        )
+
+        print(f"✅ {t('started_backend', provider='Grok', terminal='tmux pane', pane_id=pane_id)}")
         return pane_id
 
     def _start_droid_tmux(
@@ -2978,6 +3055,55 @@ class AILauncher:
         except Exception:
             pass
         self._maybe_start_provider_daemon("opencode")
+        return True
+
+    def _write_grok_session(self, runtime, tmux_session, pane_id=None, pane_title_marker=None, start_cmd=None):
+        session_file = self._project_session_file(".grok-session")
+
+        writable, reason, fix = check_session_writable(session_file)
+        if not writable:
+            print(f"❌ Cannot write {session_file.name}: {reason}", file=sys.stderr)
+            print(f"💡 Fix: {fix}", file=sys.stderr)
+            return False
+
+        data = {
+            "session_id": self.session_id,
+            "ccb_session_id": self.session_id,
+            "ccb_project_id": compute_ccb_project_id(self.project_root),
+            "runtime_dir": str(runtime),
+            "terminal": self.terminal_type,
+            "tmux_session": tmux_session,
+            "pane_id": pane_id,
+            "pane_title_marker": pane_title_marker,
+            "work_dir": str(self.project_root),
+            "work_dir_norm": _normalize_path_for_match(str(self.project_root)),
+            "start_dir": str(self.invocation_dir),
+            "active": True,
+            "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "start_cmd": str(start_cmd) if start_cmd else None,
+        }
+
+        ok, err = safe_write_session(session_file, json.dumps(data, ensure_ascii=False, indent=2))
+        if not ok:
+            print(err, file=sys.stderr)
+            return False
+        try:
+            upsert_registry({
+                "ccb_session_id": self.session_id,
+                "ccb_project_id": compute_ccb_project_id(self.project_root),
+                "work_dir": str(self.project_root),
+                "terminal": self.terminal_type,
+                "providers": {
+                    "grok": {
+                        "pane_id": pane_id,
+                        "pane_title_marker": pane_title_marker,
+                        "session_file": str(session_file),
+                    }
+                },
+            })
+        except Exception:
+            pass
+        self._maybe_start_provider_daemon("grok")
         return True
 
     def _write_droid_session(self, runtime, tmux_session, pane_id=None, pane_title_marker=None, start_cmd=None):
@@ -4240,7 +4366,7 @@ def cmd_kill(args):
         return _kill_global_zombies(yes=yes)
 
     # Project-level cleanup (original behavior)
-    providers = _parse_providers(args.providers or ["codex", "gemini", "opencode", "claude", "droid"], allow_unknown=True)
+    providers = _parse_providers(args.providers or ["codex", "gemini", "opencode", "claude", "droid", "grok"], allow_unknown=True)
     if not providers:
         return 2
 
@@ -4251,6 +4377,7 @@ def cmd_kill(args):
         "opencode": OASK_CLIENT_SPEC,
         "claude": LASK_CLIENT_SPEC,
         "droid": DASK_CLIENT_SPEC,
+        "grok": RASK_CLIENT_SPEC,
     }
 
     for provider in providers:
@@ -4327,12 +4454,12 @@ def _parse_providers(values: list[str], *, allow_unknown: bool = False) -> list[
     Parse providers from argv.
 
     Accept both:
-      - space-separated: `ccb codex gemini opencode claude droid`
-      - comma-separated: `ccb codex,gemini,opencode,claude,droid`
+      - space-separated: `ccb codex gemini opencode claude droid grok`
+      - comma-separated: `ccb codex,gemini,opencode,claude,droid,grok`
 
     Returns a de-duplicated list preserving order.
     """
-    allowed = {"codex", "gemini", "opencode", "claude", "droid"}
+    allowed = {"codex", "gemini", "opencode", "claude", "droid", "grok"}
     raw_parts = _split_provider_tokens(values)
 
     if not raw_parts:
@@ -4352,8 +4479,8 @@ def _parse_providers(values: list[str], *, allow_unknown: bool = False) -> list[
 
     if unknown and not allow_unknown:
         print(f"❌ invalid provider(s): {', '.join(unknown)}", file=sys.stderr)
-        print("💡 use: ccb codex gemini opencode claude droid  (spaces)  or  ccb codex,gemini,opencode,claude,droid  (commas)", file=sys.stderr)
-        print("💡 allowed: codex, gemini, opencode, claude, droid", file=sys.stderr)
+        print("💡 use: ccb codex gemini opencode claude droid grok  (spaces)  or  ccb codex,gemini,opencode,claude,droid,grok  (commas)", file=sys.stderr)
+        print("💡 allowed: codex, gemini, opencode, claude, droid, grok", file=sys.stderr)
         return []
 
     return parsed
@@ -4364,7 +4491,7 @@ def _parse_providers_with_cmd(values: list[str]) -> tuple[list[str], bool]:
     Parse providers from argv and treat "cmd" as a separate flag.
     Returns (providers, cmd_enabled).
     """
-    allowed = {"codex", "gemini", "opencode", "claude", "droid"}
+    allowed = {"codex", "gemini", "opencode", "claude", "droid", "grok"}
     raw_parts = _split_provider_tokens(values)
     if not raw_parts:
         return [], False
