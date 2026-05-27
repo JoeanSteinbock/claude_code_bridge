@@ -8,14 +8,21 @@ stdout, return. No log readers, no pane plumbing.
 The pane (if present) is for the human's interactive use; programmatic asks
 go straight to the binary. This trades the conversation-continuation feature
 (every ask is a fresh context) for vastly simpler integration.
+
+Media (image_gen / image_edit / video_gen): Grok writes outputs to
+`~/.grok/sessions/<url-encoded-cwd>/<session-id>/{images,videos}/N.{jpg,mp4,...}`
+and references them by absolute path in the assistant's reply text. We
+extract those paths into `ProviderResult.attachments` so the completion
+hook can sendPhoto / sendVideo over Telegram.
 """
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 from askd.adapters.base import BaseProviderAdapter, ProviderRequest, ProviderResult, QueuedTask
 from askd_runtime import log_path, write_log
@@ -41,6 +48,32 @@ def _write_log(line: str) -> None:
 
 def _grok_binary() -> str:
     return (os.environ.get("GROK_BIN") or "grok").strip() or "grok"
+
+
+# Grok writes media into ~/.grok/sessions/<encoded-cwd>/<session-id>/{images,videos}/N.{ext}
+# The model surfaces those paths verbatim in its reply text. Detect any absolute
+# path under ~/.grok/sessions whose extension looks like a known media format —
+# this also matches edited variants (e.g. 2.jpg after image_edit) and future
+# subfolders. URL-encoded path segments (%2F, etc.) are kept; that's how Grok
+# names them on disk.
+_GROK_MEDIA_RE = re.compile(
+    r"(?P<path>/(?:home/[^/\s]+|root)/\.grok/sessions/[^\s`)]+/(?:images|videos)/[^\s`)]+\.(?:jpg|jpeg|png|webp|gif|mp4|webm|mov))",
+    re.IGNORECASE,
+)
+
+
+def _extract_media_paths(text: str) -> List[str]:
+    """Pull absolute Grok-session media paths out of stdout, in order, de-duped."""
+    if not text:
+        return []
+    seen: dict[str, None] = {}
+    for m in _GROK_MEDIA_RE.finditer(text):
+        path = m.group("path")
+        # Trim trailing punctuation the regex may have picked up.
+        path = path.rstrip(".,;:!?")
+        if path not in seen and Path(path).exists():
+            seen[path] = None
+    return list(seen.keys())
 
 
 class GrokAdapter(BaseProviderAdapter):
@@ -155,6 +188,9 @@ class GrokAdapter(BaseProviderAdapter):
             done_seen = False
 
         done_ms = _now_ms() - started_ms if done_seen else None
+        attachments = _extract_media_paths(final_reply)
+        if attachments:
+            _write_log(f"[INFO] grok attachments req_id={task.req_id} count={len(attachments)}")
 
         reply_for_hook = final_reply or default_reply_for_status(status, done_seen=done_seen)
         notify_completion(
@@ -172,6 +208,7 @@ class GrokAdapter(BaseProviderAdapter):
             caller_pane_id=req.caller_pane_id,
             caller_terminal=req.caller_terminal,
             telegram_chat_id=("" if req.telegram_sync_reply else req.telegram_chat_id),
+            attachments=attachments,
         )
 
         result = ProviderResult(
@@ -182,6 +219,7 @@ class GrokAdapter(BaseProviderAdapter):
             done_seen=done_seen,
             done_ms=done_ms,
             status=status,
+            extra={"attachments": attachments} if attachments else None,
         )
         _write_log(f"[INFO] done provider=grok req_id={task.req_id} exit={result.exit_code} status={status}")
         return result

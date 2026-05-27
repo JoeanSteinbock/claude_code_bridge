@@ -92,6 +92,7 @@ def _run_hook_async(
     caller_pane_id: str = "",
     caller_terminal: str = "",
     telegram_chat_id: str = "",
+    attachments: Optional[list[str]] = None,
 ) -> None:
     """Run the completion hook in a background thread."""
     if not env_bool("CCB_COMPLETION_HOOK_ENABLED", True):
@@ -152,6 +153,12 @@ def _run_hook_async(
                 env["CCB_CALLER_TERMINAL"] = caller_terminal
             if telegram_chat_id:
                 env["CCB_TELEGRAM_CHAT_ID"] = telegram_chat_id
+            # Newline-separated absolute paths for files the hook should
+            # attach (sendPhoto / sendVideo). Currently produced by the
+            # GrokAdapter when image_gen / image_edit / video_gen fires.
+            # Newline is safe because POSIX paths never contain '\n'.
+            if attachments:
+                env["CCB_ATTACHMENTS"] = "\n".join(str(p) for p in attachments if p)
 
             # Pass reply via stdin to avoid command line length limits
             # Use longer timeout for SMTP retries (3 retries * 8s max backoff + send time)
@@ -186,6 +193,7 @@ def notify_completion(
     caller_pane_id: str = "",
     caller_terminal: str = "",
     telegram_chat_id: str = "",
+    attachments: Optional[list[str]] = None,
 ) -> None:
     """
     Notify the caller that a CCB delegation task has completed.
@@ -219,4 +227,5 @@ def notify_completion(
         caller_pane_id,
         caller_terminal,
         telegram_chat_id,
+        attachments,
     )

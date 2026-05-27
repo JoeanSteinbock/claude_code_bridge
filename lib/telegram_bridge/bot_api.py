@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import html
 import json
+import mimetypes
 import re
+import secrets
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,24 +13,71 @@ from urllib import parse, request
 from urllib.error import HTTPError, URLError
 
 
+_FENCED_RE = re.compile(r"```([a-zA-Z0-9_+\-]*)\n?(.*?)```", re.DOTALL)
+_INLINE_CODE_RE = re.compile(r"`([^`\n]+)`")
 _BOLD_DOUBLE_RE = re.compile(r"\*\*([^*\n]+?)\*\*")
 _BOLD_DOUBLE_UNDERSCORE_RE = re.compile(r"__([^_\n]+?)__")
+_LINK_RE = re.compile(r"\[([^\]\n]+)\]\(([^)\s]+)\)")
 
 
-def to_telegram_markdown(text: str) -> str:
-    """
-    Convert GitHub-flavored markdown (which models emit by default) into
-    Telegram legacy-Markdown — `**bold**` → `*bold*`, `__bold__` → `_bold_`.
+def markdown_to_telegram_html(text: str) -> str:
+    """Convert common Markdown to Telegram's HTML subset.
 
-    Why: most providers are trained to emit `**bold**`. Telegram's legacy
-    Markdown parser uses single asterisks; without conversion replies show
-    raw `**` characters instead of formatting.
+    We send with `parse_mode=HTML` rather than legacy Markdown because
+    HTML treats stray `_` and `*` as plain characters. Legacy Markdown
+    used to choke on identifiers like `bot_token` or `claude_code_bridge`
+    in prose: it'd read the first underscore as opening italic, fail to
+    find a close, return 400 'can't parse entities', and our send_message
+    wrapper would fall back to RAW text (showing `**bold**` literally).
+    HTML mode eliminates that whole class of failure.
+
+    Conversions:
+        `**bold**` / `__bold__`        → `<b>...</b>`
+        `` `code` ``                    → `<code>...</code>`
+        ```` ```fenced``` ````          → `<pre>...</pre>`
+            (with optional language tag → `<pre><code class="language-X">...</code></pre>`)
+        `[label](url)`                  → `<a href="url">label</a>`
+
+    Italic conversion is intentionally skipped — bare `_` / `*` in
+    identifiers is too common to safely italicize.
     """
     if not text:
         return text
-    text = _BOLD_DOUBLE_RE.sub(r"*\1*", text)
-    text = _BOLD_DOUBLE_UNDERSCORE_RE.sub(r"_\1_", text)
+
+    # 1. Escape `<`, `>`, `&` first so user-supplied prose can't break HTML.
+    #    The markdown markers (`*`, `_`, `` ` ``, `[`, `]`, `(`, `)`) are
+    #    untouched by html.escape, so the regex passes below still match.
+    text = html.escape(text, quote=False)
+
+    # 2. Code blocks first (so a `**` inside a code fence doesn't get
+    #    converted to <b>). Body is already HTML-escaped from step 1.
+    def _fenced(m: re.Match) -> str:
+        lang = (m.group(1) or "").strip()
+        body = m.group(2).rstrip()
+        if lang:
+            return f'<pre><code class="language-{lang}">{body}</code></pre>'
+        return f"<pre>{body}</pre>"
+
+    text = _FENCED_RE.sub(_fenced, text)
+    text = _INLINE_CODE_RE.sub(r"<code>\1</code>", text)
+
+    # 3. Bold (skip italic — too many false positives on identifiers).
+    text = _BOLD_DOUBLE_RE.sub(r"<b>\1</b>", text)
+    text = _BOLD_DOUBLE_UNDERSCORE_RE.sub(r"<b>\1</b>", text)
+
+    # 4. Inline links. URL `&` already escaped to `&amp;` by step 1,
+    #    which is correct inside an HTML attribute (Telegram un-escapes
+    #    on parse). Quote chars in URLs are rare; if they occur the
+    #    attribute breaks, but the rest of the message still delivers.
+    text = _LINK_RE.sub(r'<a href="\2">\1</a>', text)
+
     return text
+
+
+# Back-compat alias. Kept so other code that imported the old name still
+# works during the rollout — the function now returns HTML instead of
+# Markdown, and callers must use parse_mode=HTML to match.
+to_telegram_markdown = markdown_to_telegram_html
 
 
 @dataclass
@@ -156,13 +206,172 @@ class TelegramBotClient:
             raise TelegramApiError(f"Network error downloading {file_path}: {exc}") from exc
         return dest
 
+    def send_photo(
+        self,
+        chat_id: str | int,
+        file_path: str | Path,
+        *,
+        caption: str = "",
+        reply_to_message_id: int | None = None,
+    ) -> dict[str, Any]:
+        """Upload a local image file via multipart/form-data → sendPhoto.
+
+        Caption is rendered through markdown_to_telegram_html so prefixes
+        like `[Grok]` survive consistently with text replies. On parse
+        failure, retry without parse_mode (same fallback as send_message).
+        """
+        return self._send_media(
+            method="sendPhoto",
+            chat_id=chat_id,
+            field_name="photo",
+            file_path=file_path,
+            caption=caption,
+            reply_to_message_id=reply_to_message_id,
+        )
+
+    def send_video(
+        self,
+        chat_id: str | int,
+        file_path: str | Path,
+        *,
+        caption: str = "",
+        reply_to_message_id: int | None = None,
+    ) -> dict[str, Any]:
+        return self._send_media(
+            method="sendVideo",
+            chat_id=chat_id,
+            field_name="video",
+            file_path=file_path,
+            caption=caption,
+            reply_to_message_id=reply_to_message_id,
+        )
+
+    def send_document(
+        self,
+        chat_id: str | int,
+        file_path: str | Path,
+        *,
+        caption: str = "",
+        reply_to_message_id: int | None = None,
+    ) -> dict[str, Any]:
+        return self._send_media(
+            method="sendDocument",
+            chat_id=chat_id,
+            field_name="document",
+            file_path=file_path,
+            caption=caption,
+            reply_to_message_id=reply_to_message_id,
+        )
+
+    def _send_media(
+        self,
+        *,
+        method: str,
+        chat_id: str | int,
+        field_name: str,
+        file_path: str | Path,
+        caption: str,
+        reply_to_message_id: int | None,
+    ) -> dict[str, Any]:
+        path = Path(file_path)
+        if not path.is_file():
+            raise TelegramApiError(f"Media file not found: {path}")
+
+        fields: dict[str, str] = {"chat_id": str(chat_id)}
+        if caption:
+            fields["caption"] = markdown_to_telegram_html(caption)
+            fields["parse_mode"] = "HTML"
+        if reply_to_message_id:
+            fields["reply_to_message_id"] = str(int(reply_to_message_id))
+
+        try:
+            return self._call_multipart(method, fields, field_name, path)
+        except TelegramApiError as exc:
+            msg = str(exc).lower()
+            if "parse" in msg or "entity" in msg or "can't find end" in msg or "unsupported" in msg:
+                fields.pop("parse_mode", None)
+                fields["caption"] = caption or ""
+                return self._call_multipart(method, fields, field_name, path)
+            raise
+
+    def _call_multipart(
+        self,
+        method: str,
+        fields: dict[str, str],
+        file_field: str,
+        file_path: Path,
+    ) -> Any:
+        boundary = "----CCBTG" + secrets.token_hex(16)
+        body = self._build_multipart(boundary, fields, file_field, file_path)
+        url = f"{self.base_url}/{method}"
+        headers = {
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "Content-Length": str(len(body)),
+        }
+        req = request.Request(url, data=body, headers=headers, method="POST")
+        try:
+            with request.urlopen(req, timeout=self.http_timeout) as resp:
+                resp_body = resp.read().decode("utf-8", errors="replace")
+        except HTTPError as exc:
+            resp_body = exc.read().decode("utf-8", errors="replace")
+            raise TelegramApiError(f"HTTP {exc.code}: {resp_body}") from exc
+        except URLError as exc:
+            raise TelegramApiError(f"Network error: {exc}") from exc
+        except Exception as exc:
+            raise TelegramApiError(f"Telegram API request failed: {exc}") from exc
+
+        try:
+            parsed = json.loads(resp_body)
+        except json.JSONDecodeError as exc:
+            raise TelegramApiError(f"Bad JSON from Telegram: {exc}: {resp_body[:200]}") from exc
+        if not parsed.get("ok"):
+            raise TelegramApiError(f"Telegram error: {parsed.get('description', resp_body)}")
+        return parsed.get("result")
+
+    @staticmethod
+    def _build_multipart(
+        boundary: str,
+        fields: dict[str, str],
+        file_field: str,
+        file_path: Path,
+    ) -> bytes:
+        # Stdlib-only multipart/form-data assembly. Telegram is tolerant of
+        # missing Content-Length on parts, so we keep this simple.
+        crlf = b"\r\n"
+        parts: list[bytes] = []
+        for name, value in fields.items():
+            parts.append(b"--" + boundary.encode())
+            parts.append(crlf)
+            parts.append(
+                f'Content-Disposition: form-data; name="{name}"'.encode()
+            )
+            parts.append(crlf + crlf)
+            parts.append(str(value).encode("utf-8"))
+            parts.append(crlf)
+        # File part
+        filename = file_path.name
+        mime, _ = mimetypes.guess_type(filename)
+        mime = mime or "application/octet-stream"
+        parts.append(b"--" + boundary.encode())
+        parts.append(crlf)
+        parts.append(
+            f'Content-Disposition: form-data; name="{file_field}"; filename="{filename}"'.encode()
+        )
+        parts.append(crlf)
+        parts.append(f"Content-Type: {mime}".encode())
+        parts.append(crlf + crlf)
+        parts.append(file_path.read_bytes())
+        parts.append(crlf)
+        parts.append(b"--" + boundary.encode() + b"--" + crlf)
+        return b"".join(parts)
+
     def send_message(self, chat_id: str | int, text: str, *, reply_to_message_id: int | None = None) -> dict[str, Any]:
         original = text or ""
         payload: dict[str, Any] = {
             "chat_id": str(chat_id),
-            "text": to_telegram_markdown(original),
+            "text": markdown_to_telegram_html(original),
             "disable_web_page_preview": True,
-            "parse_mode": "Markdown",
+            "parse_mode": "HTML",
         }
         if reply_to_message_id:
             payload["reply_to_message_id"] = int(reply_to_message_id)
@@ -170,9 +379,9 @@ class TelegramBotClient:
             return self._call("sendMessage", payload)
         except TelegramApiError as exc:
             msg = str(exc).lower()
-            if "parse" in msg or "entity" in msg or "can't find end" in msg:
-                # Unbalanced markup — retry as plain text so the message at
-                # least gets through.
+            if "parse" in msg or "entity" in msg or "can't find end" in msg or "unsupported" in msg:
+                # Malformed HTML (rare — converter is conservative) — retry
+                # as plain text so the message at least gets through.
                 payload.pop("parse_mode", None)
                 payload["text"] = original
                 return self._call("sendMessage", payload)
@@ -192,9 +401,9 @@ class TelegramBotClient:
         target instead of a bare URL."""
         payload: dict[str, Any] = {
             "chat_id": str(chat_id),
-            "text": to_telegram_markdown(text or ""),
+            "text": markdown_to_telegram_html(text or ""),
             "disable_web_page_preview": True,
-            "parse_mode": "Markdown",
+            "parse_mode": "HTML",
             "reply_markup": {
                 "inline_keyboard": [[{"text": button_text, "url": button_url}]]
             },
@@ -205,7 +414,7 @@ class TelegramBotClient:
             return self._call("sendMessage", payload)
         except TelegramApiError as exc:
             msg = str(exc).lower()
-            if "parse" in msg or "entity" in msg or "can't find end" in msg:
+            if "parse" in msg or "entity" in msg or "can't find end" in msg or "unsupported" in msg:
                 payload.pop("parse_mode", None)
                 payload["text"] = text or ""
                 return self._call("sendMessage", payload)

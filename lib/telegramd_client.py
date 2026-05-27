@@ -121,3 +121,55 @@ def send_telegram_message(
         return {"success": True, "delivered": delivered}
     except TelegramApiError as exc:
         return {"success": False, "error": str(exc)}
+
+
+def send_telegram_media(
+    file_path: str | Path,
+    *,
+    caption: str = "",
+    work_dir: str | Path | None = None,
+    chat_ids: list[str] | None = None,
+    http_timeout: float = 120.0,
+) -> dict:
+    """Upload a local file as photo/video/document based on extension.
+
+    Photos (jpg/png/webp/gif) → sendPhoto. Videos (mp4/webm/mov) → sendVideo.
+    Anything else → sendDocument. Returns the same {success, delivered}
+    shape as send_telegram_message so the completion hook can reuse error
+    handling.
+    """
+    config = load_config(work_dir)
+    if not config.enabled:
+        return {"success": False, "error": "Telegram bridge disabled"}
+    if not is_configured(config, work_dir):
+        return {"success": False, "error": "Telegram bridge not configured"}
+
+    targets = [str(x).strip() for x in (chat_ids or config.allowed_chat_ids) if str(x).strip()]
+    if not targets:
+        return {"success": False, "error": "No allowed chat IDs configured"}
+
+    path = Path(file_path)
+    if not path.is_file():
+        return {"success": False, "error": f"File not found: {path}"}
+
+    ext = path.suffix.lower().lstrip(".")
+    kind = "document"
+    if ext in {"jpg", "jpeg", "png", "webp", "gif"}:
+        kind = "photo"
+    elif ext in {"mp4", "webm", "mov"}:
+        kind = "video"
+
+    try:
+        client = TelegramBotClient(config.bot_token, http_timeout=http_timeout)
+        delivered = 0
+        for chat_id in targets:
+            if kind == "photo":
+                client.send_photo(chat_id, path, caption=caption)
+            elif kind == "video":
+                client.send_video(chat_id, path, caption=caption)
+            else:
+                client.send_document(chat_id, path, caption=caption)
+            delivered += 1
+        return {"success": True, "delivered": delivered, "kind": kind}
+    except TelegramApiError as exc:
+        return {"success": False, "error": str(exc)}
