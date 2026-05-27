@@ -557,6 +557,7 @@ def main() -> int:
         "gemini": "Gemini",
         "opencode": "OpenCode",
         "droid": "Droid",
+        "grok": "Grok",
     }
     provider_display = provider_names.get(provider, provider.capitalize())
     req_id = args.req_id or "unknown"
@@ -592,6 +593,7 @@ def main() -> int:
             "gemini": ".gemini-session",
             "opencode": ".opencode-session",
             "droid": ".droid-session",
+            "grok": ".grok-session",
         }
         session_filename = session_files.get(caller, ".claude-session")
 

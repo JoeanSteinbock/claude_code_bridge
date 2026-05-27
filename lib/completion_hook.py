@@ -191,7 +191,7 @@ def notify_completion(
     Notify the caller that a CCB delegation task has completed.
 
     Args:
-        provider: Provider name (codex, gemini, opencode, droid)
+        provider: Provider name (codex, gemini, opencode, droid, claude, copilot, codebuddy, qwen, grok)
         output_file: Path to the output file (if any)
         reply: The reply text from the provider
         req_id: The request ID

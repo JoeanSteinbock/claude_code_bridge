@@ -32,6 +32,7 @@ SESSION_FILES = {
     "copilot": ".copilot-session",
     "codebuddy": ".codebuddy-session",
     "qwen": ".qwen-session",
+    "grok": ".grok-session",
 }
 
 # Matches the `[Provider]` prefix our bot prepends to every reply
@@ -54,16 +55,50 @@ def _looks_like_single_emoji(text: str) -> bool:
     return True
 
 
-def _provider_from_replied_to(reply_to_message: dict | None) -> str | None:
-    """If the user replied to one of our `[Provider]` messages, return that provider."""
-    if not isinstance(reply_to_message, dict):
+def _match_provider_prefix(body: str) -> str | None:
+    if not body:
         return None
-    body = str(reply_to_message.get("text", "") or reply_to_message.get("caption", "") or "").lstrip()
-    m = _PROVIDER_PREFIX_RE.match(body)
+    m = _PROVIDER_PREFIX_RE.match(body.lstrip())
     if not m:
         return None
     candidate = m.group(1).lower()
     return candidate if candidate in SUPPORTED_PROVIDERS else None
+
+
+def _provider_from_replied_to(msg: dict | None) -> str | None:
+    """If the user replied to (or quoted) one of our `[Provider]` messages,
+    return that provider. Checks `reply_to_message`, `external_reply`
+    (cross-chat reply, Telegram 2023+), and `quote` (the user-highlighted
+    snippet) — any of which may carry the prefix depending on which
+    Telegram client UI the user used."""
+    if not isinstance(msg, dict):
+        return None
+
+    # Same-chat reply: full original Message object.
+    rtm = msg.get("reply_to_message")
+    if isinstance(rtm, dict):
+        body = str(rtm.get("text", "") or rtm.get("caption", "") or "")
+        provider = _match_provider_prefix(body)
+        if provider:
+            return provider
+
+    # Cross-chat / external reply (newer Telegram feature).
+    ext = msg.get("external_reply")
+    if isinstance(ext, dict):
+        provider = _match_provider_prefix(str(ext.get("text", "") or ""))
+        if provider:
+            return provider
+
+    # User-highlighted quote snippet (may not include the `[Provider]`
+    # prefix if the user only quoted a portion mid-message — that's
+    # fine, falls through to None).
+    quote = msg.get("quote")
+    if isinstance(quote, dict):
+        provider = _match_provider_prefix(str(quote.get("text", "") or ""))
+        if provider:
+            return provider
+
+    return None
 
 
 def _format_sender(user: dict | None) -> str:
@@ -696,7 +731,19 @@ class TelegramDaemon:
             providers = [p for p in self.config.broadcast_providers if p in mounted_set]
         else:
             # Precedence: explicit prefix > reply_to target > default_provider.
-            inferred = _provider_from_replied_to(msg.get("reply_to_message"))
+            inferred = _provider_from_replied_to(msg)
+            if not inferred:
+                # Diagnostic: log what we saw so a mis-routed reply is
+                # debuggable. Truncated to 80 chars per field.
+                rtm_body = str((msg.get("reply_to_message") or {}).get("text", "") or
+                               (msg.get("reply_to_message") or {}).get("caption", "") or "")[:80]
+                ext_body = str((msg.get("external_reply") or {}).get("text", "") or "")[:80]
+                qte_body = str((msg.get("quote") or {}).get("text", "") or "")[:80]
+                if rtm_body or ext_body or qte_body:
+                    _write_log(
+                        f"[telegramd] reply-route miss: rtm={rtm_body!r} ext={ext_body!r} quote={qte_body!r}",
+                        self.project_root,
+                    )
             chosen = parsed.provider or inferred or self.config.default_provider
             providers = [chosen]
 

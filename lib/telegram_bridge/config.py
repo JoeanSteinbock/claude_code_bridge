@@ -18,6 +18,7 @@ SUPPORTED_PROVIDERS = [
     "copilot",
     "codebuddy",
     "qwen",
+    "grok",
 ]
 
 

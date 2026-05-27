@@ -6,7 +6,7 @@ Usage:
     ask <provider> [options] <message>
 
 Providers:
-    gemini, codex, opencode, droid, claude, copilot, codebuddy, qwen
+    gemini, codex, opencode, droid, claude, copilot, codebuddy, qwen, grok
 
 Modes:
     Default (async):  Background task with hook callback
@@ -32,6 +32,7 @@ from pathlib import Path
 
 PROVIDER_DISPLAY = {
     "opencode": "OpenCode",
+    "grok": "Grok",
 }
 
 
@@ -60,6 +61,7 @@ PROVIDER_DAEMONS = {
     "copilot": "hask",
     "codebuddy": "bask",
     "qwen": "qask",
+    "grok": "rask",
 }
 
 CALLER_SESSION_FILES = {
@@ -71,6 +73,7 @@ CALLER_SESSION_FILES = {
     "copilot": ".copilot-session",
     "codebuddy": ".codebuddy-session",
     "qwen": ".qwen-session",
+    "grok": ".grok-session",
 }
 
 CALLER_PANE_ENV_HINTS = {
@@ -81,6 +84,7 @@ CALLER_PANE_ENV_HINTS = {
     "copilot": ("COPILOT_TMUX_SESSION", "COPILOT_WEZTERM_PANE"),
     "codebuddy": ("CODEBUDDY_TMUX_SESSION", "CODEBUDDY_WEZTERM_PANE"),
     "qwen": ("QWEN_TMUX_SESSION", "QWEN_WEZTERM_PANE"),
+    "grok": ("GROK_TMUX_SESSION", "GROK_WEZTERM_PANE"),
 }
 
 CALLER_ENV_HINTS = {
@@ -91,6 +95,7 @@ CALLER_ENV_HINTS = {
     "copilot": ("COPILOT_SESSION_ID", "COPILOT_RUNTIME_DIR"),
     "codebuddy": ("CODEBUDDY_SESSION_ID", "CODEBUDDY_RUNTIME_DIR"),
     "qwen": ("QWEN_SESSION_ID", "QWEN_RUNTIME_DIR"),
+    "grok": ("GROK_SESSION_ID", "GROK_RUNTIME_DIR"),
 }
 
 VALID_CALLERS = set(CALLER_SESSION_FILES.keys()) | {"email", "manual", "telegram"}
@@ -535,7 +540,7 @@ def _usage() -> None:
     print("Usage: ask <provider> [options] <message>", file=sys.stderr)
     print("", file=sys.stderr)
     print("Providers:", file=sys.stderr)
-    print("  gemini, codex, opencode, droid, claude, copilot, codebuddy, qwen", file=sys.stderr)
+    print("  gemini, codex, opencode, droid, claude, copilot, codebuddy, qwen, grok", file=sys.stderr)
     print("", file=sys.stderr)
     print("Options:", file=sys.stderr)
     print("  -h, --help              Show this help message", file=sys.stderr)
