@@ -62,6 +62,23 @@ _GROK_MEDIA_RE = re.compile(
 )
 
 
+# Grok 0.2.20+ auto-discovers Claude Code's bundled MCP servers (Linear,
+# Notion, Figma, Slack, Asana) and spawns a worker per server at startup.
+# Without OAuth tokens those workers die with "worker quit with fatal:" lines
+# on stderr — cosmetic, the main reply worker is unaffected. Strip the noise
+# before it ends up in completion-hook output / Telegram replies.
+_GROK_STDERR_NOISE_RE = re.compile(
+    r"^\s*\d{4}-\d{2}-\d{2}T[\d:.]+Z\s+ERROR\s+worker quit with fatal:.*$",
+    re.MULTILINE,
+)
+
+
+def _strip_grok_stderr_noise(text: str) -> str:
+    if not text:
+        return text
+    return _GROK_STDERR_NOISE_RE.sub("", text).strip()
+
+
 def _extract_media_paths(text: str) -> List[str]:
     """Pull absolute Grok-session media paths out of stdout, in order, de-duped."""
     if not text:
@@ -182,7 +199,7 @@ class GrokAdapter(BaseProviderAdapter):
             done_seen = True
         else:
             status = COMPLETION_STATUS_FAILED
-            err_tail = (proc.stderr or "").strip()
+            err_tail = _strip_grok_stderr_noise((proc.stderr or "").strip())
             out_tail = (proc.stdout or "").strip()
             final_reply = err_tail or out_tail or f"Grok exited with code {proc.returncode}"
             done_seen = False
