@@ -39,6 +39,28 @@ SESSION_FILES = {
 # (see _run_request). Used to infer routing when a user taps reply.
 _PROVIDER_PREFIX_RE = re.compile(r"^\[([A-Za-z][A-Za-z0-9_-]*)\]")
 
+# Grok writes image_gen / image_edit / video_gen outputs under
+# ~/.grok/sessions/<encoded-cwd>/<session>/{images,videos}/N.{ext}
+# and prints the path verbatim in its reply. Telegramd reads `ask grok`
+# stdout in sync mode (bypassing the completion hook's attachment plumb),
+# so we re-extract here and sendPhoto/sendVideo each match. Mirror of
+# _GROK_MEDIA_RE in lib/askd/adapters/grok.py — keep in sync if updating.
+_GROK_MEDIA_RE = re.compile(
+    r"(?P<path>/(?:home/[^/\s]+|root)/\.grok/sessions/[^\s`)]+/(?:images|videos)/[^\s`)]+\.(?:jpg|jpeg|png|webp|gif|mp4|webm|mov))",
+    re.IGNORECASE,
+)
+
+
+def _extract_grok_media(text: str) -> list[str]:
+    if not text:
+        return []
+    seen: dict[str, None] = {}
+    for m in _GROK_MEDIA_RE.finditer(text):
+        path = m.group("path").rstrip(".,;:!?")
+        if path not in seen and Path(path).is_file():
+            seen[path] = None
+    return list(seen.keys())
+
 
 def _looks_like_single_emoji(text: str) -> bool:
     """True iff `text` is plausibly just one emoji (single-codepoint or
@@ -976,6 +998,27 @@ class TelegramDaemon:
                 except Exception as exc:
                     _write_log(
                         f"[telegramd] reaction fallback → text (chat={chat_id}, emoji={reply!r}): {exc}",
+                        self.project_root,
+                    )
+            # Grok image_gen / video_gen path relay: the GrokAdapter writes
+            # the absolute file path into the reply text. Sync mode bypasses
+            # the completion hook's attachment plumb, so we re-extract here
+            # and sendPhoto/sendVideo first, then post the text.
+            attachments = _extract_grok_media(reply) if provider == "grok" else []
+            for idx, file_path in enumerate(attachments):
+                caption = f"[{provider.capitalize()}]" if idx == 0 else ""
+                try:
+                    path_obj = Path(file_path)
+                    ext = path_obj.suffix.lower().lstrip(".")
+                    if ext in {"jpg", "jpeg", "png", "webp", "gif"}:
+                        self.client.send_photo(chat_id, path_obj, caption=caption, reply_to_message_id=reply_to_message_id if idx == 0 else None)
+                    elif ext in {"mp4", "webm", "mov"}:
+                        self.client.send_video(chat_id, path_obj, caption=caption, reply_to_message_id=reply_to_message_id if idx == 0 else None)
+                    else:
+                        self.client.send_document(chat_id, path_obj, caption=caption, reply_to_message_id=reply_to_message_id if idx == 0 else None)
+                except Exception as exc:
+                    _write_log(
+                        f"[telegramd] grok media send failed chat={chat_id} path={file_path}: {exc}",
                         self.project_root,
                     )
             self._send_text(chat_id, f"[{provider.capitalize()}]\n{reply}", reply_to_message_id=reply_to_message_id)

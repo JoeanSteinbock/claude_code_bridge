@@ -845,6 +845,27 @@ class ClaudeCommunicator:
                 data = {}
             if not isinstance(data, dict):
                 data = {}
+
+            # Backfill CCB-side routing fields from in-memory state so a partial
+            # on-disk read doesn't wipe them on write-back. Without this guard
+            # a transient empty/corrupted file (or a stale write from a prior
+            # writer that knew only the Claude-CLI fields) silently strips
+            # `pane_id` / `session_id` / `terminal`, after which the telegramd
+            # `_send_text` lookup errors with `claude session has no pane_id`
+            # and the bot can no longer route messages to this pane.
+            # Observed on 2026-05-22 (kyc-rip project) after a CCB restart cycle.
+            for _key, _fallback in (
+                ("session_id", self.session_info.get("session_id")),
+                ("pane_id", getattr(self, "pane_id", None) or self.session_info.get("pane_id")),
+                ("pane_title_marker", getattr(self, "pane_title_marker", None) or self.session_info.get("pane_title_marker")),
+                ("terminal", getattr(self, "terminal", None) or self.session_info.get("terminal")),
+                ("start_dir", self.session_info.get("start_dir")),
+                ("started_at", self.session_info.get("started_at")),
+                ("ccb_project_id", self.session_info.get("ccb_project_id")),
+            ):
+                if not data.get(_key) and _fallback:
+                    data[_key] = _fallback
+
             work_dir_path: Path
             raw_work_dir = data.get("work_dir")
             work_dir = raw_work_dir.strip() if isinstance(raw_work_dir, str) else ""
