@@ -387,6 +387,46 @@ class TelegramBotClient:
                 return self._call("sendMessage", payload)
             raise
 
+    def edit_message_text(
+        self,
+        chat_id: str | int,
+        message_id: int,
+        text: str,
+    ) -> dict[str, Any] | None:
+        """editMessageText. Returns None if Telegram rejects (e.g. message gone)."""
+        payload: dict[str, Any] = {
+            "chat_id": str(chat_id),
+            "message_id": int(message_id),
+            "text": markdown_to_telegram_html(text or ""),
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        }
+        try:
+            return self._call("editMessageText", payload)
+        except TelegramApiError as exc:
+            msg = str(exc).lower()
+            if "parse" in msg or "entity" in msg or "can't find end" in msg or "unsupported" in msg:
+                payload.pop("parse_mode", None)
+                payload["text"] = text or ""
+                try:
+                    return self._call("editMessageText", payload)
+                except TelegramApiError:
+                    return None
+            # "message is not modified" is benign — content unchanged.
+            if "not modified" in msg or "message to edit not found" in msg:
+                return None
+            return None
+
+    def delete_message(self, chat_id: str | int, message_id: int) -> None:
+        """deleteMessage. Errors are swallowed (best-effort cleanup)."""
+        try:
+            self._call("deleteMessage", {
+                "chat_id": str(chat_id),
+                "message_id": int(message_id),
+            })
+        except TelegramApiError:
+            pass
+
     def send_message_with_url_button(
         self,
         chat_id: str | int,

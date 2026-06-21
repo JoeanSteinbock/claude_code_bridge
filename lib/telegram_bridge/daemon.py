@@ -50,6 +50,53 @@ _GROK_MEDIA_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Hermes live tool-chain — markers that signal "the agent is doing X right now".
+# Strip ANSI escape sequences before matching so terminal colour codes don't
+# wreck the regex. Each provider's TUI uses slightly different glyphs:
+#   claude     `❯` for tool invocation, `✻` / `⏺` for status
+#   opencode   `◆` for actions, `┃ Run` for shell calls
+#   codex      `▌`, `❯`, `✻` similar shape to claude
+#   qwen       `◆` similar to opencode
+# Pattern below captures the LATEST line that looks like agent activity. If no
+# marker matches, falls back to last non-empty line (best effort).
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+_HERMES_MARKERS = re.compile(
+    r"^\s*[◆❯✻⏺▌●][^\n]{0,200}",
+    re.MULTILINE,
+)
+
+
+def _parse_latest_activity(text: str) -> str:
+    """Extract the most recent agent-activity line from a pane snapshot.
+
+    Best-effort heuristic. Strips ANSI, hunts for tool-call glyphs, falls
+    back to the last non-empty visible line.
+    """
+    if not text:
+        return ""
+    plain = _ANSI_RE.sub("", text)
+    matches = _HERMES_MARKERS.findall(plain)
+    if matches:
+        line = matches[-1].strip()
+        # Keep it Telegram-friendly: short, no surrounding noise.
+        return line[:180]
+    # Fallback — last non-empty line.
+    for line in reversed([ln.strip() for ln in plain.splitlines() if ln.strip()]):
+        return line[:180]
+    return ""
+
+
+def _capture_pane_tail(pane_id: str, lines: int = 120) -> str:
+    """Snapshot the last `lines` lines of a tmux pane. Empty string on failure."""
+    try:
+        cap = subprocess.run(
+            ["tmux", "capture-pane", "-p", "-t", pane_id, "-S", f"-{int(lines)}"],
+            capture_output=True, text=True, timeout=3.0,
+        )
+        return cap.stdout or ""
+    except Exception:
+        return ""
+
 
 def _extract_grok_media(text: str) -> list[str]:
     if not text:
@@ -935,10 +982,58 @@ class TelegramDaemon:
             typing_thread = Thread(target=_typing_loop, name="telegramd-typing", daemon=True)
             typing_thread.start()
 
+        # Hermes live tool-chain: post a single status message and keep
+        # editMessageText'ing it with the latest agent activity. Deleted on
+        # completion so the channel only retains the final reply. Skipped if
+        # provider has no tmux pane (e.g. headless grok).
+        hermes_stop = Event()
+        hermes_message_id: list[int] = []  # boxed so the closure can mutate
+
+        def _hermes_loop(pane_id: str) -> None:
+            posted = False
+            last_text = ""
+            # Initial dwell — don't fire for sub-3s tasks.
+            if hermes_stop.wait(3.0):
+                return
+            while not hermes_stop.is_set():
+                activity = _parse_latest_activity(_capture_pane_tail(pane_id, 120))
+                text = f"[{provider.capitalize()}] ⏳ {activity}" if activity else f"[{provider.capitalize()}] ⏳ working…"
+                if text != last_text:
+                    try:
+                        if not posted:
+                            resp = self.client.send_message(chat_id, text)
+                            mid = int((resp or {}).get("message_id") or 0) if isinstance(resp, dict) else 0
+                            if mid:
+                                hermes_message_id.append(mid)
+                                posted = True
+                        elif hermes_message_id:
+                            self.client.edit_message_text(chat_id, hermes_message_id[0], text)
+                    except Exception:
+                        pass
+                    last_text = text
+                hermes_stop.wait(10.0)
+
+        hermes_thread: Optional[Thread] = None
+        hermes_pane = self._lookup_pane_id_for_provider(provider)
+        if hermes_pane and self.config.send_acknowledgements:
+            hermes_thread = Thread(target=_hermes_loop, args=(hermes_pane,), name="telegramd-hermes", daemon=True)
+            hermes_thread.start()
+
+        def _stop_hermes() -> None:
+            if hermes_thread is not None:
+                hermes_stop.set()
+                hermes_thread.join(timeout=1.0)
+            if hermes_message_id:
+                try:
+                    self.client.delete_message(chat_id, hermes_message_id[0])
+                except Exception:
+                    pass
+
         def _stop_typing() -> None:
             if typing_thread is not None:
                 typing_stop.set()
                 typing_thread.join(timeout=1.0)
+            _stop_hermes()
 
         ask_cmd = self._find_ask_command()
         if not ask_cmd:
@@ -1542,6 +1637,28 @@ class TelegramDaemon:
             f"✅ @{bot_username} live at `{target}`.\n"
             f"DM it to start working in that project.",
         )
+
+    def _lookup_pane_id_for_provider(self, provider: str) -> str:
+        """Return the tmux pane id for `provider` in this project, or ''.
+
+        Shared lookup used by `/tail` and the Hermes live tool-chain. Reads the
+        provider's session file from project config dir; ignores wezterm panes
+        (capture-pane is tmux-only).
+        """
+        try:
+            session_filename = SESSION_FILES.get(provider)
+            if not session_filename:
+                return ""
+            session_file = find_project_session_file(self.project_root, session_filename)
+            if not session_file or not session_file.exists():
+                return ""
+            data = json.loads(session_file.read_text(encoding="utf-8-sig"))
+        except Exception:
+            return ""
+        if (data.get("terminal") or "").strip().lower() != "tmux":
+            return ""
+        pane_id = str(data.get("pane_id") or "").strip()
+        return pane_id if pane_id.startswith("%") else ""
 
     def _run_tail_command(
         self,
