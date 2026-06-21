@@ -69,20 +69,26 @@ _HERMES_MARKERS = re.compile(
 def _parse_latest_activity(text: str) -> str:
     """Extract the most recent agent-activity line from a pane snapshot.
 
-    Best-effort heuristic. Strips ANSI, hunts for tool-call glyphs, falls
-    back to the last non-empty visible line.
+    Best-effort heuristic. Strips ANSI, hunts for tool-call glyphs, skips
+    bare-cursor noise (a lone `❯` with nothing after it is just the input
+    prompt, not activity). Falls back to the last non-empty visible line.
     """
     if not text:
         return ""
     plain = _ANSI_RE.sub("", text)
     matches = _HERMES_MARKERS.findall(plain)
-    if matches:
-        line = matches[-1].strip()
-        # Keep it Telegram-friendly: short, no surrounding noise.
-        return line[:180]
-    # Fallback — last non-empty line.
+    # Walk matches newest-first; skip lines whose post-glyph content has
+    # fewer than 3 visible chars (bare cursor `❯`, decorative `●` headers).
+    for raw in reversed(matches):
+        line = raw.strip()
+        # Drop the leading glyph + any whitespace and see what's left.
+        body = line[1:].strip() if line else ""
+        if len(body) >= 3:
+            return line[:180]
+    # Fallback — last non-empty line that's NOT just a cursor / box-drawing.
     for line in reversed([ln.strip() for ln in plain.splitlines() if ln.strip()]):
-        return line[:180]
+        if len(line) >= 4 and not all(c in "─━│┃┌┐└┘├┤┬┴┼ " for c in line):
+            return line[:180]
     return ""
 
 
