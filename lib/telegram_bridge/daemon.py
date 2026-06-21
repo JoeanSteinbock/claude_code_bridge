@@ -427,8 +427,34 @@ class TelegramDaemon:
                 if not updates:
                     time.sleep(self.config.polling_interval_seconds)
                     continue
+                # Dispatch each update in its own daemon thread so a slow
+                # synchronous handler (e.g. `/tail` capturing a busy pane,
+                # `/respawn` blocking on tmux respawn, a synchronous wake
+                # roundtrip) does not stall the polling loop. Ask requests
+                # already hand off via `_chat_queue` / `_chat_worker`, so
+                # this addition only changes behaviour for the slash-command
+                # path. We update `last_update_id` BEFORE spawning so the
+                # next long-poll advances even if a handler hangs.
+                advanced = False
                 for update in updates:
-                    self._handle_update(update)
+                    try:
+                        uid = int(update.get("update_id") or 0)
+                        if uid > self.state.last_update_id:
+                            self.state.last_update_id = uid
+                            advanced = True
+                    except Exception:
+                        pass
+                    Thread(
+                        target=self._handle_update_safely,
+                        args=(update,),
+                        daemon=True,
+                        name=f"telegramd-dispatch-{update.get('update_id', '?')}",
+                    ).start()
+                if advanced:
+                    try:
+                        write_daemon_state(self.state, self.project_root)
+                    except Exception:
+                        pass
             except TelegramApiError as exc:
                 _write_log(f"[telegramd] api error: {exc}", self.project_root)
                 time.sleep(max(2, self.config.polling_interval_seconds))
@@ -576,6 +602,22 @@ class TelegramDaemon:
                     wav_path.unlink()
             except Exception:
                 pass
+
+    def _handle_update_safely(self, update: dict) -> None:
+        """Thread entrypoint — never let a handler exception kill the worker.
+
+        The polling loop spawns one of these per update so a slow / blocking
+        handler (e.g. /tail capturing a stuck pane) does not stall the loop.
+        last_update_id and the persisted state are advanced by the polling
+        loop BEFORE this fires, so we don't need to redo that here.
+        """
+        try:
+            self._handle_update(update)
+        except Exception as exc:
+            _write_log(
+                f"[telegramd] dispatch worker error: {exc}",
+                self.project_root,
+            )
 
     def _handle_update(self, update: dict) -> None:
         update_id = int(update.get("update_id", 0) or 0)
