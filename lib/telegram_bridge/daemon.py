@@ -70,6 +70,20 @@ _HERMES_MARKERS = re.compile(
 )
 
 
+# Substrings that mean "this line is protocol scaffolding or Claude TUI
+# chrome, not real agent activity" — Hermes should never surface them.
+# `CCB_REQ_ID` / `CCB_BEGIN` / `CCB_DONE` / `CCB_TASK_COMPLETED` are our
+# own protocol markers. `Tip:` lines are Claude TUI's marketing chrome.
+_HERMES_SKIP_SUBSTR = (
+    "CCB_REQ_ID",
+    "CCB_BEGIN",
+    "CCB_DONE",
+    "CCB_TASK_COMPLETED",
+    "Tip:",
+    "Share Claude Code",
+)
+
+
 def _parse_latest_activity(text: str, user_prompt: str = "") -> str:
     """Extract the most recent agent-activity line from a pane snapshot.
 
@@ -104,6 +118,8 @@ def _parse_latest_activity(text: str, user_prompt: str = "") -> str:
             continue
         if needle and needle in body.lower():
             continue
+        if any(skip in line for skip in _HERMES_SKIP_SUBSTR):
+            continue
         glyph = line[:1]
         # Tier 1 = real activity. Includes the full Claude spinner family
         # (✶✻✽✺✷✸❅✦✱), tool record/subline (⏺⎿), generic tool call (◆),
@@ -120,13 +136,15 @@ def _parse_latest_activity(text: str, user_prompt: str = "") -> str:
     for bucket in (tier1, tier2, tier3):
         if bucket:
             return bucket[-1][:180]
-    # Fallback — last non-empty line that's not box-drawing or the user prompt.
+    # Fallback — last non-empty line that's not box-drawing, user prompt, or scaffolding.
     for line in reversed([ln.strip() for ln in plain.splitlines() if ln.strip()]):
         if len(line) < 4:
             continue
         if needle and needle in line.lower():
             continue
         if all(c in "─━│┃┌┐└┘├┤┬┴┼ " for c in line):
+            continue
+        if any(skip in line for skip in _HERMES_SKIP_SUBSTR):
             continue
         return line[:180]
     return ""
