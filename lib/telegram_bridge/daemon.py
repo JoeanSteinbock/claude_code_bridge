@@ -1372,6 +1372,13 @@ class TelegramDaemon:
         # the late completion marker. Skipped when we have no pane (headless
         # providers) — those use the old post-and-return behaviour.
         if result.returncode != 0 and late_log_path is not None:
+            # Stop typing + Hermes BEFORE posting warning so the live
+            # transients get deleted and the warning becomes the only
+            # in-chat indicator until the watcher fires. Without this,
+            # Hermes kept emitting bullets after the timeout — the loop
+            # was alive until `_run_request` returned, but the closure's
+            # `hermes_message_ids` were never drained for delete.
+            _stop_typing()
             warning_msg_id = 0
             try:
                 resp = self.client.send_message(
