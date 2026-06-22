@@ -1160,6 +1160,16 @@ class TelegramDaemon:
             offset = _pane_log_offset(log_path)
             seen_signatures: set[str] = set()
             needle = (message or "").strip().split("\n", 1)[0][:80].lower()
+            # Backfill protection: when the pane log is fresh after a bounce
+            # (or `claude --resume` replays history into it AFTER offset
+            # capture), the first poll can surface dozens of stale bullets
+            # and flood the chat. Detect that and skip-but-record-signatures
+            # so future polls only emit truly-new lines. Also enforce hard
+            # ceilings so a runaway never overruns the chat.
+            first_poll = True
+            MAX_TRANSIENT_PER_ASK = 20
+            MAX_BULLETS_PER_CYCLE = 3
+            FIRST_POLL_BACKFILL_THRESHOLD = 5
             while not hermes_stop.is_set():
                 try:
                     new_text = _read_pane_log_from_offset(log_path, offset)
@@ -1169,7 +1179,32 @@ class TelegramDaemon:
                             offset = log_path.stat().st_size
                         except Exception:
                             pass
-                        for bullet in _extract_new_bullets(new_text, seen_signatures, needle):
+                        bullets = _extract_new_bullets(new_text, seen_signatures, needle)
+                        # First poll backfill suppression — sigs were already
+                        # added to `seen_signatures` by _extract_new_bullets,
+                        # so we won't re-emit them on subsequent polls.
+                        if first_poll and len(bullets) > FIRST_POLL_BACKFILL_THRESHOLD:
+                            _write_log(
+                                f"[telegramd] hermes backfill suppressed "
+                                f"chat={chat_id} provider={provider} count={len(bullets)}",
+                                self.project_root,
+                            )
+                            bullets = []
+                        first_poll = False
+                        # Per-cycle cap — if real activity is still emitting
+                        # faster than we can post, keep only the latest.
+                        if len(bullets) > MAX_BULLETS_PER_CYCLE:
+                            bullets = bullets[-MAX_BULLETS_PER_CYCLE:]
+                        # Hard ceiling on total transient messages per ask.
+                        remaining = MAX_TRANSIENT_PER_ASK - len(hermes_message_ids)
+                        if remaining <= 0:
+                            # Already at ceiling — stop spamming, but keep
+                            # polling so we update seen_signatures and don't
+                            # backlog when the ask eventually completes.
+                            bullets = []
+                        else:
+                            bullets = bullets[:remaining]
+                        for bullet in bullets:
                             text = f"[{provider.capitalize()}] ⏳ {bullet[:140]}"
                             try:
                                 resp = self.client.send_message(chat_id, text)
