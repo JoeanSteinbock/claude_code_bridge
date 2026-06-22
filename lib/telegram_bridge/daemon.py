@@ -66,29 +66,61 @@ _HERMES_MARKERS = re.compile(
 )
 
 
-def _parse_latest_activity(text: str) -> str:
+def _parse_latest_activity(text: str, user_prompt: str = "") -> str:
     """Extract the most recent agent-activity line from a pane snapshot.
 
     Best-effort heuristic. Strips ANSI, hunts for tool-call glyphs, skips
     bare-cursor noise (a lone `❯` with nothing after it is just the input
-    prompt, not activity). Falls back to the last non-empty visible line.
+    prompt, not activity), and skips lines that echo the user's own prompt
+    (Claude TUI renders the user message with a `●` bullet too, so the naive
+    last-glyph match catches "● <user question>" instead of Claude's reply).
+
+    `user_prompt` — optional first ~80 chars of what we sent in; lines that
+    contain it are treated as echo and skipped.
+
+    Glyph priority (newest-first within each tier):
+      Tier 1: `✻` (thinking), `⏺` (tool result), `◆` (tool call), `▌` (codex step)
+      Tier 2: `●` (Claude bullet — could be user echo or section header)
+      Tier 3: `❯` (input cursor)
+    Falls back to the last non-empty visible line that's not box-drawing.
     """
     if not text:
         return ""
     plain = _ANSI_RE.sub("", text)
-    matches = _HERMES_MARKERS.findall(plain)
-    # Walk matches newest-first; skip lines whose post-glyph content has
-    # fewer than 3 visible chars (bare cursor `❯`, decorative `●` headers).
-    for raw in reversed(matches):
+    needle = (user_prompt or "").strip().split("\n", 1)[0][:80].lower()
+
+    # Bucket matches by tier so high-signal glyphs win over `● user echo`.
+    tier1: list[str] = []
+    tier2: list[str] = []
+    tier3: list[str] = []
+    for raw in _HERMES_MARKERS.findall(plain):
         line = raw.strip()
-        # Drop the leading glyph + any whitespace and see what's left.
         body = line[1:].strip() if line else ""
-        if len(body) >= 3:
-            return line[:180]
-    # Fallback — last non-empty line that's NOT just a cursor / box-drawing.
+        if len(body) < 3:
+            continue
+        if needle and needle in body.lower():
+            continue
+        glyph = line[:1]
+        if glyph in "✻⏺◆▌":
+            tier1.append(line)
+        elif glyph == "●":
+            tier2.append(line)
+        elif glyph == "❯":
+            tier3.append(line)
+        else:
+            tier2.append(line)
+    for bucket in (tier1, tier2, tier3):
+        if bucket:
+            return bucket[-1][:180]
+    # Fallback — last non-empty line that's not box-drawing or the user prompt.
     for line in reversed([ln.strip() for ln in plain.splitlines() if ln.strip()]):
-        if len(line) >= 4 and not all(c in "─━│┃┌┐└┘├┤┬┴┼ " for c in line):
-            return line[:180]
+        if len(line) < 4:
+            continue
+        if needle and needle in line.lower():
+            continue
+        if all(c in "─━│┃┌┐└┘├┤┬┴┼ " for c in line):
+            continue
+        return line[:180]
     return ""
 
 
@@ -1002,7 +1034,7 @@ class TelegramDaemon:
             if hermes_stop.wait(3.0):
                 return
             while not hermes_stop.is_set():
-                activity = _parse_latest_activity(_capture_pane_tail(pane_id, 120))
+                activity = _parse_latest_activity(_capture_pane_tail(pane_id, 120), user_prompt=message)
                 text = f"[{provider.capitalize()}] ⏳ {activity}" if activity else f"[{provider.capitalize()}] ⏳ working…"
                 if text != last_text:
                     try:
