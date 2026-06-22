@@ -211,15 +211,20 @@ def _extract_new_bullets(text: str, seen_signatures: set, needle: str = "") -> l
     prompt (first 80 chars, lowercased) — lines containing it are skipped
     as echoes. Honours the same skip-list as `_parse_latest_activity`.
 
-    Bullets are lines whose first non-space character is one of the
-    tier-1 markers (✶✻✽✺✷✸❅✦✱⏺⎿◆▌) or the generic claude bullet `●`.
-    Cursor / input markers `❯` are excluded — they're never substantive.
+    Bullets are lines whose first non-space character is a tool-call
+    marker (`●⏺⎿◆▌`). Thinking-spinner glyphs (`✶✻✽✺✷✸❅✦✱`) are
+    excluded entirely — Claude TUI animates through them many times per
+    second with bodies like `✱ thinking` / `✻ 76 thinking`, which would
+    flood the chat with one transient message per frame. The user wants
+    only actual tool activity surfaced. Cursor markers `❯` are also
+    excluded (never substantive).
     """
     if not text:
         return []
     plain = _ANSI_RE.sub("", text)
     out: list[str] = []
-    bullet_glyphs = "✶✻✽✺✷✸❅✦✱⏺⎿◆▌●"
+    # Tool-call markers only. Spinner glyphs deliberately omitted; see docstring.
+    bullet_glyphs = "⏺⎿◆▌●"
     for raw in plain.splitlines():
         line = raw.strip()
         if len(line) < 4:
