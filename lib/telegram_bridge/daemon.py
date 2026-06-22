@@ -203,6 +203,15 @@ def _read_pane_log_from_offset(log_path: Optional[Path], offset: int) -> str:
     return _ANSI_RE.sub("", text)
 
 
+# Sublines under `⎿` are sometimes real tool output (`⎿ === port 9338 ===`,
+# `⎿ Read foo.py (49 lines)`) and sometimes just in-progress spinner-style
+# labels Claude TUI shows during a tool run (`⎿ Running…`, `⎿ Waiting…`,
+# `⎿ Searching…`). The second kind is animation noise — drop it.
+_HERMES_INPROGRESS_RE = re.compile(
+    r"^[A-Za-z]+\s*[.…]+$",  # `Running…`, `Waiting...`, `Hashing…`
+)
+
+
 def _extract_new_bullets(text: str, seen_signatures: set, needle: str = "") -> list[str]:
     """Pull *new* agent-activity bullets out of newly-appended pane content.
 
@@ -238,6 +247,13 @@ def _extract_new_bullets(text: str, seen_signatures: set, needle: str = "") -> l
         if needle and needle in body.lower():
             continue
         if any(skip in line for skip in _HERMES_SKIP_SUBSTR):
+            continue
+        # Drop in-progress spinner sublines (`⎿ Running…`, `⎿ Waiting…`).
+        # They use the `⎿` glyph (same as legit tool-result sublines) but
+        # the body is just a single word + ellipsis. Real result sublines
+        # always carry substantive content (paths, line counts, output
+        # excerpts) so they pass this check.
+        if glyph == "⎿" and _HERMES_INPROGRESS_RE.match(body):
             continue
         # Signature ignores trailing whitespace + collapses inner spaces so
         # the same bullet re-rendered with different padding (Claude TUI
