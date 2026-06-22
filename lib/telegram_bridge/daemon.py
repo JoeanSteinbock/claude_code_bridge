@@ -203,6 +203,48 @@ def _read_pane_log_from_offset(log_path: Optional[Path], offset: int) -> str:
     return _ANSI_RE.sub("", text)
 
 
+def _extract_new_bullets(text: str, seen_signatures: set, needle: str = "") -> list[str]:
+    """Pull *new* agent-activity bullets out of newly-appended pane content.
+
+    `seen_signatures` is mutated in place with a fingerprint per bullet
+    so the next call won't re-emit the same line. `needle` is the user's
+    prompt (first 80 chars, lowercased) — lines containing it are skipped
+    as echoes. Honours the same skip-list as `_parse_latest_activity`.
+
+    Bullets are lines whose first non-space character is one of the
+    tier-1 markers (✶✻✽✺✷✸❅✦✱⏺⎿◆▌) or the generic claude bullet `●`.
+    Cursor / input markers `❯` are excluded — they're never substantive.
+    """
+    if not text:
+        return []
+    plain = _ANSI_RE.sub("", text)
+    out: list[str] = []
+    bullet_glyphs = "✶✻✽✺✷✸❅✦✱⏺⎿◆▌●"
+    for raw in plain.splitlines():
+        line = raw.strip()
+        if len(line) < 4:
+            continue
+        glyph = line[:1]
+        if glyph not in bullet_glyphs:
+            continue
+        body = line[1:].strip()
+        if len(body) < 3:
+            continue
+        if needle and needle in body.lower():
+            continue
+        if any(skip in line for skip in _HERMES_SKIP_SUBSTR):
+            continue
+        # Signature ignores trailing whitespace + collapses inner spaces so
+        # the same bullet re-rendered with different padding (Claude TUI
+        # re-paints frequently) doesn't double-fire.
+        sig = " ".join(line.split())[:140]
+        if sig in seen_signatures:
+            continue
+        seen_signatures.add(sig)
+        out.append(line)
+    return out
+
+
 def _capture_pane_tail(pane_id: str, lines: int = 120) -> str:
     """Snapshot the last `lines` lines of a tmux pane. Empty string on failure."""
     try:
@@ -1099,36 +1141,49 @@ class TelegramDaemon:
             typing_thread = Thread(target=_typing_loop, name="telegramd-typing", daemon=True)
             typing_thread.start()
 
-        # Hermes live tool-chain: post a single status message and keep
-        # editMessageText'ing it with the latest agent activity. Deleted on
-        # completion so the channel only retains the final reply. Skipped if
-        # provider has no tmux pane (e.g. headless grok).
+        # Hermes live tool-chain: stream each NEW agent bullet (`● Read …`,
+        # `● Bash …`, `✶ Thinking …`, etc.) as it lands in the pane, so the
+        # user sees the actual progress flow — not just the latest line.
+        # All transient messages are deleted on completion so only the
+        # final reply remains in the channel. Skipped for headless
+        # providers (no tmux pane).
         hermes_stop = Event()
-        hermes_message_id: list[int] = []  # boxed so the closure can mutate
+        hermes_message_ids: list[int] = []  # all transient ids, for cleanup
 
         def _hermes_loop(pane_id: str) -> None:
-            posted = False
-            last_text = ""
+            log_path = _resolve_pane_log_path(pane_id)
+            if not log_path:
+                return
             # Initial dwell — don't fire for sub-3s tasks.
             if hermes_stop.wait(3.0):
                 return
+            offset = _pane_log_offset(log_path)
+            seen_signatures: set[str] = set()
+            needle = (message or "").strip().split("\n", 1)[0][:80].lower()
             while not hermes_stop.is_set():
-                activity = _parse_latest_activity(_capture_pane_tail(pane_id, 120), user_prompt=message)
-                text = f"[{provider.capitalize()}] ⏳ {activity}" if activity else f"[{provider.capitalize()}] ⏳ working…"
-                if text != last_text:
-                    try:
-                        if not posted:
-                            resp = self.client.send_message(chat_id, text)
-                            mid = int((resp or {}).get("message_id") or 0) if isinstance(resp, dict) else 0
-                            if mid:
-                                hermes_message_id.append(mid)
-                                posted = True
-                        elif hermes_message_id:
-                            self.client.edit_message_text(chat_id, hermes_message_id[0], text)
-                    except Exception:
-                        pass
-                    last_text = text
-                hermes_stop.wait(10.0)
+                try:
+                    new_text = _read_pane_log_from_offset(log_path, offset)
+                    if new_text:
+                        # Advance offset by raw byte length (pre-ANSI strip).
+                        try:
+                            offset = log_path.stat().st_size
+                        except Exception:
+                            pass
+                        for bullet in _extract_new_bullets(new_text, seen_signatures, needle):
+                            text = f"[{provider.capitalize()}] ⏳ {bullet[:140]}"
+                            try:
+                                resp = self.client.send_message(chat_id, text)
+                                mid = int((resp or {}).get("message_id") or 0) if isinstance(resp, dict) else 0
+                                if mid:
+                                    hermes_message_ids.append(mid)
+                            except Exception:
+                                pass
+                except Exception as exc:
+                    _write_log(
+                        f"[telegramd] hermes loop error chat={chat_id}: {exc}",
+                        self.project_root,
+                    )
+                hermes_stop.wait(4.0)
 
         hermes_thread: Optional[Thread] = None
         hermes_pane = self._lookup_pane_id_for_provider(provider)
@@ -1140,11 +1195,13 @@ class TelegramDaemon:
             if hermes_thread is not None:
                 hermes_stop.set()
                 hermes_thread.join(timeout=1.0)
-            if hermes_message_id:
+            # Delete every transient bullet message we posted.
+            for mid in list(hermes_message_ids):
                 try:
-                    self.client.delete_message(chat_id, hermes_message_id[0])
+                    self.client.delete_message(chat_id, mid)
                 except Exception:
                     pass
+            hermes_message_ids.clear()
 
         def _stop_typing() -> None:
             if typing_thread is not None:
