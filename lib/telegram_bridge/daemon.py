@@ -61,7 +61,11 @@ _GROK_MEDIA_RE = re.compile(
 # marker matches, falls back to last non-empty line (best effort).
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 _HERMES_MARKERS = re.compile(
-    r"^\s*[◆❯✻✶⏺⎿▌●][^\n]{0,200}",
+    # Claude TUI's "thinking spinner" cycles through many star/asterisk
+    # variants — `✶ ✻ ✽ ✺ ✷ ✸ ❅ ✦ ✱` — so we need all of them, not just one.
+    # ⏺/⎿ are tool record + tool result subline; ◆ is generic tool call;
+    # ▌ is codex step; ● is Claude's bullet; ❯ is the input cursor.
+    r"^\s*[◆❯✻✶✽✺✷✸❅✦✱⏺⎿▌●][^\n]{0,200}",
     re.MULTILINE,
 )
 
@@ -101,10 +105,11 @@ def _parse_latest_activity(text: str, user_prompt: str = "") -> str:
         if needle and needle in body.lower():
             continue
         glyph = line[:1]
-        # ✶ (Claude "thinking"/"Roosting" — actual TUI marker, not ✻)
-        # ⏺ (tool record), ⎿ (tool result subline), ◆ (tool call),
-        # ▌ (codex step), ✻ (kept for forward compat / other CLIs).
-        if glyph in "✶✻⏺⎿◆▌":
+        # Tier 1 = real activity. Includes the full Claude spinner family
+        # (✶✻✽✺✷✸❅✦✱), tool record/subline (⏺⎿), generic tool call (◆),
+        # and codex step (▌). All of these mean "the agent is doing
+        # something substantive" — they beat user-echo and section headers.
+        if glyph in "✶✻✽✺✷✸❅✦✱⏺⎿◆▌":
             tier1.append(line)
         elif glyph == "●":
             tier2.append(line)
@@ -1127,9 +1132,14 @@ class TelegramDaemon:
         # Cap per-Telegram-message timeout regardless of config: a stuck
         # ask (provider drift-off-format, pane hang, etc.) should fail fast
         # so the bot's chat worker doesn't head-of-line-block for an hour.
+        # 5-min cap was too aggressive — even a single tool call from
+        # Claude (e.g. `git show <large commit>`, deep playwright runs)
+        # can exceed 2 min. Bumped to 30 min — still meaningfully shorter
+        # than the 1h `request_timeout_seconds` config default but won't
+        # cut off normal multi-step investigations mid-tool.
         # Override via `CCB_TELEGRAM_ASK_TIMEOUT_S` env if a specific bot
         # really needs longer-running tasks.
-        default_cap = 300
+        default_cap = 1800
         try:
             cap = int(os.environ.get("CCB_TELEGRAM_ASK_TIMEOUT_S", "") or default_cap)
         except Exception:
