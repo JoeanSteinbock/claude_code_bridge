@@ -61,7 +61,7 @@ _GROK_MEDIA_RE = re.compile(
 # marker matches, falls back to last non-empty line (best effort).
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 _HERMES_MARKERS = re.compile(
-    r"^\s*[◆❯✻⏺▌●][^\n]{0,200}",
+    r"^\s*[◆❯✻✶⏺⎿▌●][^\n]{0,200}",
     re.MULTILINE,
 )
 
@@ -101,7 +101,10 @@ def _parse_latest_activity(text: str, user_prompt: str = "") -> str:
         if needle and needle in body.lower():
             continue
         glyph = line[:1]
-        if glyph in "✻⏺◆▌":
+        # ✶ (Claude "thinking"/"Roosting" — actual TUI marker, not ✻)
+        # ⏺ (tool record), ⎿ (tool result subline), ◆ (tool call),
+        # ▌ (codex step), ✻ (kept for forward compat / other CLIs).
+        if glyph in "✶✻⏺⎿◆▌":
             tier1.append(line)
         elif glyph == "●":
             tier2.append(line)
