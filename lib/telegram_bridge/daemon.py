@@ -132,6 +132,59 @@ def _parse_latest_activity(text: str, user_prompt: str = "") -> str:
     return ""
 
 
+# Phase C — post-timeout completion watcher.
+# Telegramd caps ask at 30 min today. For longer tasks (deep code dives,
+# slow tool chains) the ask process exits without seeing the agent's
+# CCB_DONE marker, and the partial output gets posted looking just like
+# a real final. The watcher fixes that: capture the pane log offset
+# BEFORE we run ask; if ask comes back without confirmation, tail the log
+# from that offset, find the late CCB_DONE, extract the actual reply,
+# and post that as the real final (deleting the timeout warning).
+_CCB_DONE_LINE_RE = re.compile(
+    r"^\s*CCB_DONE:\s*(\d{8}-\d{6}-\d{3}-\d+-\d+)\s*$",
+    re.MULTILINE | re.IGNORECASE,
+)
+
+
+def _resolve_pane_log_path(pane_id: str) -> Optional[Path]:
+    """Look up the on-disk pipe-pane log for a tmux pane id like `%266`."""
+    pid = (pane_id or "").strip().replace("%", "")
+    if not pid:
+        return None
+    try:
+        from terminal import _pane_log_path_for
+        return _pane_log_path_for(pane_id, "tmux", None)
+    except Exception:
+        # Fall back to the standard layout if terminal helpers aren't loadable.
+        try:
+            from askd_runtime import run_dir
+            return run_dir() / "pane-logs" / "tmux" / f"pane-{pid}.log"
+        except Exception:
+            return Path.home() / ".cache" / "ccb" / "pane-logs" / "tmux" / f"pane-{pid}.log"
+
+
+def _pane_log_offset(log_path: Optional[Path]) -> int:
+    """Current file size — used as a marker to start tailing from later."""
+    try:
+        return int(log_path.stat().st_size) if log_path and log_path.exists() else 0
+    except Exception:
+        return 0
+
+
+def _read_pane_log_from_offset(log_path: Optional[Path], offset: int) -> str:
+    """Read appended bytes since `offset` and strip ANSI. Empty on error."""
+    if not log_path or not log_path.exists():
+        return ""
+    try:
+        with log_path.open("rb") as f:
+            f.seek(max(0, int(offset)))
+            data = f.read()
+    except Exception:
+        return ""
+    text = data.decode("utf-8", errors="replace")
+    return _ANSI_RE.sub("", text)
+
+
 def _capture_pane_tail(pane_id: str, lines: int = 120) -> str:
     """Snapshot the last `lines` lines of a tmux pane. Empty string on failure."""
     try:
@@ -1146,6 +1199,16 @@ class TelegramDaemon:
             cap = default_cap
         ask_timeout_s = min(self.config.request_timeout_seconds, cap)
 
+        # Phase C: snapshot the pane log offset BEFORE ask runs so we have a
+        # marker to start late-completion tailing from if ask exits without
+        # seeing CCB_DONE. `hermes_pane` was resolved above for the live tail;
+        # we reuse it here when present.
+        late_log_path: Optional[Path] = None
+        late_log_offset: int = 0
+        if hermes_pane:
+            late_log_path = _resolve_pane_log_path(hermes_pane)
+            late_log_offset = _pane_log_offset(late_log_path)
+
         try:
             result = subprocess.run(
                 [ask_cmd, provider, "--foreground", "--timeout", str(ask_timeout_s)],
@@ -1169,11 +1232,46 @@ class TelegramDaemon:
 
         reply = (result.stdout or "").strip()
         err = (result.stderr or "").strip()
-        # Prefer sending the captured reply even on non-zero exit. Providers
-        # sometimes finish without emitting the protocol done-line (e.g. Claude
-        # ends on a tool call); the daemon flags that as exit_code=2 but has
-        # already extracted the assistant's text. Delivering that text is more
-        # useful to the user than a bare "ask exited with code 2" error.
+
+        # Phase C: non-zero exit means ask ended without seeing CCB_DONE.
+        # The user-visible text might be a *partial*, not the real conclusion.
+        # Instead of posting it as if it were final (and losing the genuine
+        # answer when Claude finally emits CCB_DONE in the pane), post a
+        # transient warning and spawn a watcher that tails the pane log for
+        # the late completion marker. Skipped when we have no pane (headless
+        # providers) — those use the old post-and-return behaviour.
+        if result.returncode != 0 and late_log_path is not None:
+            warning_msg_id = 0
+            try:
+                resp = self.client.send_message(
+                    chat_id,
+                    f"[{provider.capitalize()}] ⏱️ Hit the ask timeout — agent still working in the pane. "
+                    f"I'll post the real reply when CCB_DONE arrives (giving it up to 60 min).",
+                    reply_to_message_id=reply_to_message_id,
+                )
+                if isinstance(resp, dict):
+                    warning_msg_id = int(resp.get("message_id") or 0)
+            except Exception as exc:
+                _write_log(
+                    f"[telegramd] late-completion warning post failed chat={chat_id}: {exc}",
+                    self.project_root,
+                )
+            Thread(
+                target=self._watch_for_late_completion,
+                kwargs=dict(
+                    provider=provider,
+                    chat_id=chat_id,
+                    reply_to_message_id=reply_to_message_id,
+                    log_path=late_log_path,
+                    start_offset=late_log_offset,
+                    warning_msg_id=warning_msg_id,
+                    timeout_at=time.time() + 60 * 60,
+                ),
+                daemon=True,
+                name=f"telegramd-late-{chat_id}-{provider}",
+            ).start()
+            return
+
         if reply:
             # If the reply is essentially just an emoji, try to attach it
             # as a Telegram reaction on the source message instead of
@@ -1688,6 +1786,72 @@ class TelegramDaemon:
             f"✅ @{bot_username} live at `{target}`.\n"
             f"DM it to start working in that project.",
         )
+
+    def _watch_for_late_completion(
+        self,
+        provider: str,
+        chat_id: str,
+        reply_to_message_id: int,
+        log_path: Path,
+        start_offset: int,
+        warning_msg_id: int,
+        timeout_at: float,
+    ) -> None:
+        """Tail the pane log for a late CCB_DONE marker.
+
+        Background thread spawned by `_run_request` when ask returned
+        without seeing the protocol completion marker. Polls every 15s,
+        gives up after `timeout_at`. On success: extracts the reply
+        between the matching CCB_BEGIN/CCB_DONE pair, posts as final,
+        deletes the warning.
+        """
+        try:
+            from laskd_protocol import extract_reply_for_req
+        except Exception:
+            extract_reply_for_req = None  # type: ignore
+        seen_offset = start_offset
+        while time.time() < timeout_at and not self.stop_event.is_set():
+            try:
+                new_text = _read_pane_log_from_offset(log_path, seen_offset)
+                if new_text:
+                    matches = _CCB_DONE_LINE_RE.findall(new_text)
+                    if matches:
+                        req_id = matches[-1]
+                        reply = ""
+                        if extract_reply_for_req:
+                            try:
+                                reply = extract_reply_for_req(new_text, req_id).strip()
+                            except Exception:
+                                reply = ""
+                        if not reply:
+                            # Fallback — best-effort split.
+                            done_re = re.compile(
+                                rf"CCB_BEGIN:\s*{re.escape(req_id)}\s*\n(.*?)\nCCB_DONE:\s*{re.escape(req_id)}",
+                                re.DOTALL | re.IGNORECASE,
+                            )
+                            m = done_re.search(new_text)
+                            reply = m.group(1).strip() if m else ""
+                        if reply:
+                            try:
+                                if warning_msg_id:
+                                    self.client.delete_message(chat_id, warning_msg_id)
+                            except Exception:
+                                pass
+                            self._send_text(
+                                chat_id,
+                                f"[{provider.capitalize()}]\n{reply}",
+                                reply_to_message_id=reply_to_message_id,
+                            )
+                            return
+            except Exception as exc:
+                _write_log(
+                    f"[telegramd] late-completion watcher error chat={chat_id}: {exc}",
+                    self.project_root,
+                )
+            time.sleep(15.0)
+        # Timed out without seeing CCB_DONE — give up quietly. User can /tail
+        # to see what's happening. Warning message stays in chat as the
+        # last-known status.
 
     def _lookup_pane_id_for_provider(self, provider: str) -> str:
         """Return the tmux pane id for `provider` in this project, or ''.
