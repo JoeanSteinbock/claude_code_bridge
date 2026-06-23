@@ -59,7 +59,24 @@ _GROK_MEDIA_RE = re.compile(
 #   qwen       `◆` similar to opencode
 # Pattern below captures the LATEST line that looks like agent activity. If no
 # marker matches, falls back to last non-empty line (best effort).
-_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+_ANSI_RE = re.compile(
+    # CSI: `\x1b[...<letter>` — the bulk of colour / cursor sequences.
+    r"\x1b\[[0-9;?]*[A-Za-z]"
+    # OSC: `\x1b]...<terminator>` — terminal-title sets etc. Terminator is
+    # BEL (\x07) or ST (\x1b\\). Without this, set-title escapes like
+    # `\x1b]0;⠐ New Claude Code session started\x07` survive ANSI strip
+    # and pollute `/tail` + Hermes output.
+    r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"
+    # Lone DCS / PM / APC openers and Ptmux pass-through tokens — these
+    # tmux features can leak `\x1b\\` and `Ptmux;` markers into capture
+    # output during certain terminal interactions. Catch the obvious ones.
+    r"|\x1bP[^\x1b]*\x1b\\"
+    r"|\x1b[NOPX^_]"
+)
+# Strip "Ptmux; ... ESC \\" pass-through wrappers (tmux's escape-passthrough
+# feature for nested terminals) — surface as literal `Ptmux;` in capture-pane
+# output when ANSI prefix is partially eaten.
+_PTMUX_RE = re.compile(r"Ptmux;[^\x1b]*\x1b\\")
 _HERMES_MARKERS = re.compile(
     # Claude TUI's "thinking spinner" cycles through many star/asterisk
     # variants — `✶ ✻ ✽ ✺ ✷ ✸ ❅ ✦ ✱` — so we need all of them, not just one.
@@ -200,7 +217,7 @@ def _read_pane_log_from_offset(log_path: Optional[Path], offset: int) -> str:
     except Exception:
         return ""
     text = data.decode("utf-8", errors="replace")
-    return _ANSI_RE.sub("", text)
+    return _PTMUX_RE.sub("", _ANSI_RE.sub("", text))
 
 
 # Sublines under `⎿` are sometimes real tool output (`⎿ === port 9338 ===`,
@@ -2071,6 +2088,11 @@ class TelegramDaemon:
             self._send_text(chat_id, f"tmux capture-pane failed: {exc}",
                             reply_to_message_id=reply_to_message_id)
             return
+
+        # Strip ANSI / OSC / Ptmux escape noise. `capture-pane -p` usually
+        # gives clean text but some pipe-pane configs leak set-title
+        # sequences (`\x1b]0;…\x07`) that pollute the output.
+        tail = _PTMUX_RE.sub("", _ANSI_RE.sub("", tail))
 
         # Collapse trailing blank lines; Telegram markdown hates huge blobs,
         # so cap at ~3500 chars (covers both message limit + code-fence
