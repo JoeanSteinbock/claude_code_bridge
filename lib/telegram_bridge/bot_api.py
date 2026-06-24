@@ -365,7 +365,14 @@ class TelegramBotClient:
         parts.append(b"--" + boundary.encode() + b"--" + crlf)
         return b"".join(parts)
 
-    def send_message(self, chat_id: str | int, text: str, *, reply_to_message_id: int | None = None) -> dict[str, Any]:
+    def send_message(
+        self,
+        chat_id: str | int,
+        text: str,
+        *,
+        reply_to_message_id: int | None = None,
+        reply_markup: dict | None = None,
+    ) -> dict[str, Any]:
         original = text or ""
         payload: dict[str, Any] = {
             "chat_id": str(chat_id),
@@ -375,6 +382,8 @@ class TelegramBotClient:
         }
         if reply_to_message_id:
             payload["reply_to_message_id"] = int(reply_to_message_id)
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
         try:
             return self._call("sendMessage", payload)
         except TelegramApiError as exc:
@@ -386,6 +395,47 @@ class TelegramBotClient:
                 payload["text"] = original
                 return self._call("sendMessage", payload)
             raise
+
+    def edit_message_reply_markup(
+        self,
+        chat_id: str | int,
+        message_id: int,
+        reply_markup: dict | None,
+    ) -> None:
+        """Remove or replace the inline keyboard on an existing message.
+
+        Useful when a suggestion button has been tapped — we strip the
+        button so the user knows the action was taken. Errors are
+        swallowed (best-effort cleanup, same as `delete_message`).
+        """
+        payload: dict[str, Any] = {
+            "chat_id": str(chat_id),
+            "message_id": int(message_id),
+        }
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
+        try:
+            self._call("editMessageReplyMarkup", payload)
+        except TelegramApiError:
+            pass
+
+    def answer_callback_query(
+        self,
+        callback_query_id: str,
+        *,
+        text: str = "",
+        show_alert: bool = False,
+    ) -> None:
+        """Acknowledge an inline-keyboard tap so Telegram clears the spinner."""
+        payload: dict[str, Any] = {"callback_query_id": str(callback_query_id)}
+        if text:
+            payload["text"] = text[:200]
+        if show_alert:
+            payload["show_alert"] = True
+        try:
+            self._call("answerCallbackQuery", payload)
+        except TelegramApiError:
+            pass
 
     def edit_message_text(
         self,

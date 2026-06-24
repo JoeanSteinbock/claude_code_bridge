@@ -229,6 +229,35 @@ _HERMES_INPROGRESS_RE = re.compile(
 )
 
 
+# Suggestion detection — Claude often ends a turn with `Want me to X?`
+# (or `Should I X?`, `Shall I X?`). Captured group is the action body.
+# Strict on the question mark so we don't snag mid-paragraph musings.
+_SUGGESTION_RE = re.compile(
+    r"(?im)(?:Want me to|Should I|Shall I|Do you want me to)\s+([^?\n]{3,200})\?",
+)
+# Hard ceiling on the suggestion dict; FIFO eviction past this so a
+# busy chat doesn't bloat the daemon over hours.
+_SUGGESTION_CAP = 200
+
+
+def _extract_suggestion(reply: str) -> str:
+    """Pull the latest `Want me to X?` action from a final-reply body.
+
+    Returns the suggested action verbatim (e.g. `rebuild and redeploy
+    app.ros.rip`) — without the trailing `?` and without the lead-in
+    verb. Empty when no suggestion is detected.
+    """
+    if not reply:
+        return ""
+    matches = list(_SUGGESTION_RE.finditer(reply))
+    if not matches:
+        return ""
+    # Last match — agent's most-recent ask.
+    action = matches[-1].group(1).strip()
+    # Trim trailing punctuation we don't want repeated.
+    return action.rstrip(".,;:!")
+
+
 def _extract_new_bullets(text: str, seen_signatures: set, needle: str = "") -> list[str]:
     """Pull *new* agent-activity bullets out of newly-appended pane content.
 
@@ -602,6 +631,14 @@ class TelegramDaemon:
         # background clone. Empty until the first /mount or until
         # _mount.recover_pending repopulates it at startup.
         self._clone_events: dict[str, Event] = {}
+        # Pending agent suggestions surfaced as inline-keyboard buttons on
+        # `[Provider]` replies (`Want me to X?` → tap ✅ to dispatch X
+        # verbatim). Keyed by short tokens that fit in Telegram's 64-byte
+        # callback_data ceiling. Evicted FIFO past `_SUGGESTION_CAP` so the
+        # daemon doesn't bloat across many turns. Lost on restart — taps
+        # of expired suggestions answer with a "suggestion expired" toast.
+        self._pending_suggestions: dict[str, tuple[str, str]] = {}
+        self._pending_suggestions_lock = Lock()
 
     def start(self) -> None:
         me = self.client.get_me()
@@ -878,6 +915,15 @@ class TelegramDaemon:
         if update_id > self.state.last_update_id:
             self.state.last_update_id = update_id
             write_daemon_state(self.state, self.project_root)
+
+        # Inline-keyboard tap on a `Want me to X?` suggestion button.
+        cb = update.get("callback_query")
+        if isinstance(cb, dict):
+            try:
+                self._handle_callback_query(cb)
+            except Exception as exc:
+                _write_log(f"[telegramd] callback handler error: {exc}", self.project_root)
+            return
 
         # Managed-bots (the bot creation flow): a `managed_bot` update
         # arrives whenever a user taps a `t.me/newbot/<self>/...` link
@@ -1520,11 +1566,32 @@ class TelegramDaemon:
                         f"[telegramd] grok media send failed chat={chat_id} path={file_path}: {exc}",
                         self.project_root,
                     )
-            self._send_text(chat_id, f"[{provider.capitalize()}]\n{reply}", reply_to_message_id=reply_to_message_id)
+            # Detect a `Want me to X?` suggestion in the reply and attach
+            # a ✅ inline button so the user can dispatch the action with
+            # one tap instead of typing it back. Callback returns through
+            # `_handle_callback_query` → enqueues the action verbatim.
+            suggestion = _extract_suggestion(reply)
+            reply_markup: dict | None = None
+            if suggestion:
+                token = self._register_suggestion(provider, suggestion)
+                # Truncate the button label so it stays readable in Telegram's
+                # narrow inline-keyboard width (~30 visible chars on mobile).
+                label_action = suggestion if len(suggestion) <= 28 else suggestion[:25] + "…"
+                reply_markup = {
+                    "inline_keyboard": [[
+                        {"text": f"✅ {label_action}", "callback_data": f"sug:{token}"},
+                    ]]
+                }
+            self._send_text(
+                chat_id, f"[{provider.capitalize()}]\n{reply}",
+                reply_to_message_id=reply_to_message_id,
+                reply_markup=reply_markup,
+            )
             _write_log(
                 f"[TIMING] final reply posted chat={chat_id} provider={provider} "
                 f"total_elapsed={(time.time() - ask_started_at):.2f}s "
-                f"send_gap={(time.time() - ask_returned_at):.2f}s",
+                f"send_gap={(time.time() - ask_returned_at):.2f}s "
+                f"suggestion={'yes' if suggestion else 'no'}",
                 self.project_root,
             )
             return
@@ -1534,13 +1601,93 @@ class TelegramDaemon:
             return
         self._send_text(chat_id, f"[{provider.capitalize()}] (empty reply)", reply_to_message_id=reply_to_message_id)
 
-    def _send_text(self, chat_id: str, text: str, *, reply_to_message_id: int | None = None) -> None:
+    def _send_text(
+        self,
+        chat_id: str,
+        text: str,
+        *,
+        reply_to_message_id: int | None = None,
+        reply_markup: dict | None = None,
+    ) -> None:
         try:
-            for chunk in chunk_message(text):
-                self.client.send_message(chat_id, chunk, reply_to_message_id=reply_to_message_id)
+            chunks = list(chunk_message(text))
+            for idx, chunk in enumerate(chunks):
+                # Inline-keyboard reply_markup only attaches to the LAST
+                # chunk so the button is anchored under the full reply,
+                # not in the middle of a chunked message.
+                last = (idx == len(chunks) - 1)
+                self.client.send_message(
+                    chat_id, chunk,
+                    reply_to_message_id=reply_to_message_id,
+                    reply_markup=(reply_markup if last else None),
+                )
                 reply_to_message_id = None
         except Exception as exc:
             _write_log(f"[telegramd] send error chat={chat_id}: {exc}", self.project_root)
+
+    def _register_suggestion(self, provider: str, action: str) -> str:
+        """Stash a pending agent suggestion; return its short callback-data token."""
+        import secrets
+        token = secrets.token_hex(6)  # 12 chars → fits in 64-byte callback_data
+        with self._pending_suggestions_lock:
+            if len(self._pending_suggestions) >= _SUGGESTION_CAP:
+                # FIFO eviction — drop the oldest key.
+                oldest = next(iter(self._pending_suggestions))
+                self._pending_suggestions.pop(oldest, None)
+            self._pending_suggestions[token] = (provider, action)
+        return token
+
+    def _handle_callback_query(self, cb: dict) -> None:
+        """Process an inline-keyboard tap.
+
+        Looks up the suggestion by callback_data token, acks the tap, and
+        dispatches the suggested action through the normal chat-queue path
+        so it goes through the same ask flow as a typed message.
+        """
+        cb_id = str(cb.get("id") or "")
+        data = str(cb.get("data") or "")
+        msg = cb.get("message") or {}
+        chat = msg.get("chat") or {}
+        chat_id = str(chat.get("id") or "")
+        msg_id = int(msg.get("message_id") or 0)
+        if not (cb_id and data.startswith("sug:") and chat_id):
+            try:
+                self.client.answer_callback_query(cb_id)
+            except Exception:
+                pass
+            return
+        if self.config.allowed_chat_ids and chat_id not in self.config.allowed_chat_ids:
+            try:
+                self.client.answer_callback_query(cb_id, text="Not authorised")
+            except Exception:
+                pass
+            return
+        token = data[4:]
+        with self._pending_suggestions_lock:
+            entry = self._pending_suggestions.pop(token, None)
+        if not entry:
+            try:
+                self.client.answer_callback_query(cb_id, text="Suggestion expired")
+            except Exception:
+                pass
+            return
+        provider, action = entry
+        try:
+            self.client.answer_callback_query(cb_id, text=f"Dispatching: {action[:60]}")
+        except Exception:
+            pass
+        # Strip the button from the message so the user knows it was taken.
+        try:
+            self.client.edit_message_reply_markup(chat_id, msg_id, None)
+        except Exception:
+            pass
+        self._enqueue_for_provider(
+            chat_id=chat_id,
+            provider=provider,
+            message=action,
+            message_id=msg_id,
+            is_group=False,
+        )
 
     def _work_dir(self) -> str:
         if self.config.default_work_dir:
