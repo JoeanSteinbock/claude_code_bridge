@@ -1390,6 +1390,7 @@ class TelegramDaemon:
             late_log_path = _resolve_pane_log_path(hermes_pane)
             late_log_offset = _pane_log_offset(late_log_path)
 
+        ask_started_at = time.time()
         try:
             result = subprocess.run(
                 [ask_cmd, provider, "--foreground", "--timeout", str(ask_timeout_s)],
@@ -1399,6 +1400,13 @@ class TelegramDaemon:
                 capture_output=True,
                 text=True,
                 timeout=ask_timeout_s + 30,
+            )
+            ask_returned_at = time.time()
+            _write_log(
+                f"[TIMING] ask subprocess returned chat={chat_id} provider={provider} "
+                f"elapsed={(ask_returned_at - ask_started_at):.2f}s rc={result.returncode} "
+                f"stdout_len={len(result.stdout or '')}",
+                self.project_root,
             )
         except subprocess.TimeoutExpired:
             _stop_typing()
@@ -1513,6 +1521,12 @@ class TelegramDaemon:
                         self.project_root,
                     )
             self._send_text(chat_id, f"[{provider.capitalize()}]\n{reply}", reply_to_message_id=reply_to_message_id)
+            _write_log(
+                f"[TIMING] final reply posted chat={chat_id} provider={provider} "
+                f"total_elapsed={(time.time() - ask_started_at):.2f}s "
+                f"send_gap={(time.time() - ask_returned_at):.2f}s",
+                self.project_root,
+            )
             return
         if result.returncode != 0:
             msg = err or f"ask exited with code {result.returncode}"

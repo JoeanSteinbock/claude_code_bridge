@@ -796,6 +796,13 @@ class ClaudeAdapter(BaseProviderAdapter):
                 if is_done_text(combined, task.req_id):
                     done_seen = True
                     done_ms = _now_ms() - started_ms
+                    # Phase: when ask first SEES CCB_DONE in the JSONL.
+                    # Compare this with the telegramd post-time stamp to
+                    # locate the "minutes-long gap to TG" the user reported.
+                    _write_log(
+                        f"[TIMING] CCB_DONE seen in JSONL req_id={task.req_id} "
+                        f"done_ms={done_ms} started_ms={started_ms} now_ms={_now_ms()}"
+                    )
                     break
 
             if done_seen:
