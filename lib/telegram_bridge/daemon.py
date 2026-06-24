@@ -1574,12 +1574,13 @@ class TelegramDaemon:
             reply_markup: dict | None = None
             if suggestion:
                 token = self._register_suggestion(provider, suggestion)
-                # Truncate the button label so it stays readable in Telegram's
-                # narrow inline-keyboard width (~30 visible chars on mobile).
-                label_action = suggestion if len(suggestion) <= 28 else suggestion[:25] + "…"
+                # Just `✅ Yes`. The action text is already visible in the
+                # reply body (Claude said "Want me to X?"), so the button
+                # only needs to confirm acceptance — single short word
+                # keeps it tap-friendly. Ignoring = no tap = no follow-up.
                 reply_markup = {
                     "inline_keyboard": [[
-                        {"text": f"✅ {label_action}", "callback_data": f"sug:{token}"},
+                        {"text": "✅ Yes", "callback_data": f"sug:{token}"},
                     ]]
                 }
             self._send_text(
