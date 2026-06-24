@@ -272,6 +272,16 @@ def _extract_new_bullets(text: str, seen_signatures: set, needle: str = "") -> l
         # excerpts) so they pass this check.
         if glyph == "⎿" and _HERMES_INPROGRESS_RE.match(body):
             continue
+        # Drop `●` prose lines — Claude TUI uses `●` BOTH for tool calls
+        # (`● Bash(...)`, `● Read(...)`, `● Write(...)`) and for agent
+        # commentary / section headers (`● Found it — the homepage OG…`,
+        # `● The wiring is verified-correct at every level…`). The user
+        # only wants the real actions, not the prose summaries. Heuristic:
+        # a tool call always has a `(` near the start of the body
+        # (`Bash(`, `Read(`, `MultiEdit(`). Prose doesn't. Keep `●` only
+        # when body's first 32 chars contain `(`.
+        if glyph == "●" and "(" not in body[:32]:
+            continue
         # Signature ignores trailing whitespace + collapses inner spaces so
         # the same bullet re-rendered with different padding (Claude TUI
         # re-paints frequently) doesn't double-fire.
@@ -1187,6 +1197,12 @@ class TelegramDaemon:
         # providers (no tmux pane).
         hermes_stop = Event()
         hermes_message_ids: list[int] = []  # all transient ids, for cleanup
+        # Race guard: held by the hermes worker while sending a bullet AND
+        # appending its message_id to `hermes_message_ids`. `_stop_hermes`
+        # acquires the same lock before draining for delete, so a bullet
+        # mid-send during stop completes + registers BEFORE we try to clean
+        # up — no orphan transients survive the final reply.
+        hermes_send_lock = Lock()
 
         def _hermes_loop(pane_id: str) -> None:
             log_path = _resolve_pane_log_path(pane_id)
@@ -1243,14 +1259,23 @@ class TelegramDaemon:
                         else:
                             bullets = bullets[:remaining]
                         for bullet in bullets:
+                            if hermes_stop.is_set():
+                                break
                             text = f"[{provider.capitalize()}] ⏳ {bullet[:140]}"
-                            try:
-                                resp = self.client.send_message(chat_id, text)
-                                mid = int((resp or {}).get("message_id") or 0) if isinstance(resp, dict) else 0
-                                if mid:
-                                    hermes_message_ids.append(mid)
-                            except Exception:
-                                pass
+                            # Hold the send-lock around send+append so a
+                            # concurrent `_stop_hermes` can't race past the
+                            # in-flight bullet and leave it un-tracked (and
+                            # therefore un-deletable) after the final reply.
+                            with hermes_send_lock:
+                                if hermes_stop.is_set():
+                                    break
+                                try:
+                                    resp = self.client.send_message(chat_id, text)
+                                    mid = int((resp or {}).get("message_id") or 0) if isinstance(resp, dict) else 0
+                                    if mid:
+                                        hermes_message_ids.append(mid)
+                                except Exception:
+                                    pass
                 except Exception as exc:
                     _write_log(
                         f"[telegramd] hermes loop error chat={chat_id}: {exc}",
@@ -1267,14 +1292,22 @@ class TelegramDaemon:
         def _stop_hermes() -> None:
             if hermes_thread is not None:
                 hermes_stop.set()
-                hermes_thread.join(timeout=1.0)
-            # Delete every transient bullet message we posted.
-            for mid in list(hermes_message_ids):
-                try:
-                    self.client.delete_message(chat_id, mid)
-                except Exception:
-                    pass
-            hermes_message_ids.clear()
+                # Allow up to 10s for an in-flight HTTP send_message to
+                # complete (Telegram timeouts dominate this number). Without
+                # the bump we'd have routinely returned with a still-sending
+                # bullet and missed its delete.
+                hermes_thread.join(timeout=10.0)
+            # Acquire the send-lock so any send_message that finished AFTER
+            # the join but BEFORE we delete has its mid in
+            # `hermes_message_ids` before we drain. This closes the last
+            # window where a transient could survive the final reply.
+            with hermes_send_lock:
+                for mid in list(hermes_message_ids):
+                    try:
+                        self.client.delete_message(chat_id, mid)
+                    except Exception:
+                        pass
+                hermes_message_ids.clear()
 
         def _stop_typing() -> None:
             if typing_thread is not None:
