@@ -1413,6 +1413,23 @@ class TelegramDaemon:
 
         reply = (result.stdout or "").strip()
         err = (result.stderr or "").strip()
+        # Safety strip: ask is supposed to extract just the text BETWEEN
+        # `CCB_BEGIN: <id>` and `CCB_DONE: <id>`, but when Claude prefixes
+        # the protocol opener with a `●` bullet glyph (which the TUI does
+        # for its own assistant rendering), the anchored extraction misses
+        # the begin line and the whole wrapped block falls through. Trim
+        # any stray protocol markers + leading bullet here so they never
+        # reach the user even when ask's regex misfires.
+        if reply:
+            reply = re.sub(
+                r"^\s*●?\s*CCB_BEGIN:\s*[0-9-]+\s*\n?", "", reply,
+                flags=re.IGNORECASE,
+            )
+            reply = re.sub(
+                r"\n?\s*CCB_DONE:\s*[0-9-]+\s*$", "", reply,
+                flags=re.IGNORECASE,
+            )
+            reply = reply.strip()
 
         # Phase C: non-zero exit means ask ended without seeing CCB_DONE.
         # The user-visible text might be a *partial*, not the real conclusion.
