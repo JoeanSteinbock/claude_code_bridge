@@ -636,6 +636,7 @@ class ClaudeAdapter(BaseProviderAdapter):
         else:
             prompt = wrap_claude_prompt(req.message, task.req_id, caller=req.caller)
         backend.send_text(pane_id, prompt)
+        self._verify_prompt_accepted(backend, pane_id, task.req_id)
 
         # Use structured Claude session logs only
         result = self._wait_for_response(
@@ -664,6 +665,44 @@ class ClaudeAdapter(BaseProviderAdapter):
             )
             result.reply = default_reply_for_status(status, done_seen=result.done_seen)
         return result
+
+    _SPINNER_ACTIVE_RE = re.compile(r"[✶✻✽✺✷✸✱✢✣❅✦✧★]\s+\w+.*?…", re.UNICODE)
+
+    def _verify_prompt_accepted(self, backend: Any, pane_id: str, req_id: str) -> None:
+        """
+        After send_text, Claude's TUI occasionally ignores the trailing Enter
+        (typically when the pane is showing a just-finished turn's post-idle
+        state, e.g. `✻ Cooked for 21s`). The prompt then sits in the input
+        line and the ask times out 30 minutes later. Re-send Enter until we
+        see an active spinner, up to a few tries.
+
+        Disable with CCB_CLAUDE_VERIFY_PROMPT=0.
+        """
+        if os.environ.get("CCB_CLAUDE_VERIFY_PROMPT") == "0":
+            return
+        if not (hasattr(backend, "get_pane_content") and hasattr(backend, "send_key")):
+            return
+        interval_s = float(os.environ.get("CCB_CLAUDE_VERIFY_INTERVAL_S", "2.0"))
+        retries = int(os.environ.get("CCB_CLAUDE_VERIFY_RETRIES", "3"))
+        for attempt in range(retries):
+            time.sleep(interval_s)
+            try:
+                content = backend.get_pane_content(pane_id, lines=25) or ""
+            except Exception:
+                return
+            if self._SPINNER_ACTIVE_RE.search(content):
+                if attempt > 0:
+                    _write_log(f"[INFO] prompt accepted after {attempt} retry req_id={req_id}")
+                return
+            _write_log(
+                f"[WARN] prompt not consumed (attempt {attempt + 1}/{retries}) "
+                f"req_id={req_id}; resending Enter"
+            )
+            try:
+                backend.send_key(pane_id, "Enter")
+            except Exception:
+                return
+        _write_log(f"[WARN] prompt verification exhausted retries req_id={req_id}")
 
     def _finalize_result(self, result: ProviderResult, req: ProviderRequest, task: QueuedTask) -> None:
         _write_log(f"[INFO] done provider=claude req_id={result.req_id} exit={result.exit_code}")
