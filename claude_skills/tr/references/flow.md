@@ -128,7 +128,7 @@ Send the constructed FileOpsREQ via `/file-op`:
 /file-op <the FileOpsREQ JSON>
 ```
 
-(`/file-op` handles routing to Codex via `CCB_CALLER=claude ask codex`)
+(`/file-op` handles routing to Codex via `ask codex`)
 
 ### 6. Execute (Executor Routing)
 
@@ -179,7 +179,7 @@ Output: Review result with verdict (PASS/FIX/BLOCKED).
 If testing is needed, send test task to Codex:
 
 ```
-Bash(CCB_CALLER=claude ask codex "Run tests for this change:
+Bash(CCB_CALLER="${CCB_CALLER:-claude}" ask --background codex "Run tests for this change:
 
 Step: [step title]
 Changed files: [list]

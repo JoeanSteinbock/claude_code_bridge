@@ -20,8 +20,14 @@ The first argument must be the provider name, followed by the message:
 ## Execution (MANDATORY)
 
 ```
-Bash(CCB_CALLER=claude ask $PROVIDER "$MESSAGE")
+Bash(CCB_CALLER="${CCB_CALLER:-claude}" ask --background $PROVIDER "$MESSAGE")
 ```
+
+`CCB_CALLER` is already exported by CCB in every managed pane, so the reply is
+routed back to whichever agent sent the request (e.g. grok loading this skill
+via Claude-skill compatibility gets its own reply). Keep it as-is; only fall
+back to `claude` when unset. `--background` keeps the request async even when
+the caller is not Claude.
 
 ## Rules
 
