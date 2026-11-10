@@ -1684,12 +1684,12 @@ class TelegramDaemon:
             self.client.edit_message_reply_markup(chat_id, msg_id, None)
         except Exception:
             pass
-        self._enqueue_for_provider(
-            chat_id=chat_id,
+        self._enqueue_message(
             provider=provider,
             message=action,
-            message_id=msg_id,
+            chat_id=chat_id,
             is_group=False,
+            message_id=msg_id,
         )
 
     def _work_dir(self) -> str:
