@@ -9,6 +9,8 @@ import hashlib
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 import time
 import threading
@@ -32,6 +34,74 @@ _GEMINI_WATCH_STARTED = False
 _GEMINI_WATCH_LOCK = threading.Lock()
 _GEMINI_HASH_CACHE: dict[str, list[Path]] = {}
 _GEMINI_HASH_CACHE_TS = 0.0
+
+_IS_AGY_CACHE: dict[str, bool] = {}
+
+
+def is_agy_cli(cmd: str = "gemini") -> bool:
+    """Determine if a gemini/agy command represents Google Antigravity CLI (agy)."""
+    raw_cmd = (cmd or "").strip()
+    if not raw_cmd:
+        return False
+    first_token = raw_cmd.split()[0]
+    if first_token in _IS_AGY_CACHE:
+        return _IS_AGY_CACHE[first_token]
+
+    # 1. Direct command name match
+    token_name = Path(first_token.replace("\\", "/")).name.lower()
+    if token_name in ("agy", "antigravity", "agy.exe", "antigravity.exe"):
+        _IS_AGY_CACHE[first_token] = True
+        return True
+
+    # 2. Resolve symlink / executable path
+    which_path = shutil.which(first_token)
+    if which_path:
+        try:
+            resolved = Path(which_path).resolve()
+            resolved_name = resolved.name.lower()
+            resolved_str = str(resolved).lower()
+            if "agy" in resolved_name or "antigravity" in resolved_str:
+                _IS_AGY_CACHE[first_token] = True
+                return True
+        except Exception:
+            pass
+
+    # 3. Help output probe
+    try:
+        proc = subprocess.run(
+            [first_token, "--help"],
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+        )
+        help_text = (proc.stdout or "") + "\n" + (proc.stderr or "")
+        if "--dangerously-skip-permissions" in help_text or "Usage of agy" in help_text:
+            _IS_AGY_CACHE[first_token] = True
+            return True
+        if "--yolo" in help_text:
+            _IS_AGY_CACHE[first_token] = False
+            return False
+        if "--continue" in help_text and "--resume" not in help_text:
+            _IS_AGY_CACHE[first_token] = True
+            return True
+    except Exception:
+        pass
+
+    _IS_AGY_CACHE[first_token] = False
+    return False
+
+
+def find_gemini_cmd() -> str:
+    """Find Gemini / AGY CLI executable."""
+    env_cmd = (os.environ.get("GEMINI_START_CMD") or os.environ.get("AGY_START_CMD") or "").strip()
+    if env_cmd:
+        return env_cmd
+    if shutil.which("gemini"):
+        return "gemini"
+    if shutil.which("agy"):
+        return "agy"
+    return "gemini"
+
 
 
 def _slugify_project_hash(name: str) -> str:

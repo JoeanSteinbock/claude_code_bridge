@@ -4,6 +4,7 @@ import re
 from dataclasses import dataclass
 
 from .config import SUPPORTED_PROVIDERS
+from providers import parse_qualified_provider, resolve_provider_key
 
 
 # `/command@botname [args]` — Telegram's group-disambiguation form.
@@ -261,6 +262,19 @@ def parse_message(text: str, default_provider: str) -> ParsedTelegramText:
                     broadcast=(prefix == "all"),
                 )
 
+    # Qualified provider or configured alias prefix (e.g. `opencode:alpha: hi`, `/opencode:alpha hi`, `alpha: hi`, `/alpha hi`)
+    first_parts = raw.split(None, 1)
+    if first_parts:
+        first_tok = first_parts[0]
+        rest_body = first_parts[1].strip() if len(first_parts) > 1 else ""
+        cand_tok = first_tok.rstrip(":,")
+        if cand_tok.startswith(("/", "@")):
+            cand_tok = cand_tok[1:]
+        if cand_tok and (":" in cand_tok or first_tok.startswith(("/", "@")) or first_tok.endswith(":")):
+            resolved = _normalize_provider(cand_tok)
+            if resolved and resolved != "all" and rest_body:
+                return ParsedTelegramText(provider=resolved, message=rest_body, broadcast=False)
+
     # `@all` anywhere in the text → broadcast to configured providers.
     # Using a word-boundary regex so we don't match inside emails or
     # usernames like `@allen_123`.
@@ -291,6 +305,9 @@ def _normalize_provider(value: str) -> str:
         return "all"
     if provider in SUPPORTED_PROVIDERS:
         return provider
+    base, inst, qualified = resolve_provider_key(provider, allowed_bases=set(SUPPORTED_PROVIDERS))
+    if base in SUPPORTED_PROVIDERS and (inst or ":" in provider or "=" in provider or qualified != provider):
+        return qualified
     return ""
 
 

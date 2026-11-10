@@ -25,6 +25,8 @@ sys.path.insert(0, str(lib_dir))
 from cli_output import EXIT_ERROR, EXIT_OK
 from pane_registry import load_registry_by_project_id, _get_providers_map
 from project_id import compute_ccb_project_id
+from providers import resolve_provider_key, session_filename_for_provider
+from session_utils import find_project_session_file
 from terminal import get_backend_for_session
 
 
@@ -52,38 +54,51 @@ def main(argv: list[str]) -> int:
         _usage()
         return EXIT_ERROR
 
-    provider = argv[1].lower()
+    raw_provider = argv[1].lower()
 
-    if provider in ("-h", "--help"):
+    if raw_provider in ("-h", "--help"):
         _usage()
         return EXIT_OK
 
-    if provider not in PROVIDER_COMMANDS:
-        print(f"[ERROR] Unknown provider: {provider}", file=sys.stderr)
+    work_dir = Path(os.environ.get("CCB_WORK_DIR") or os.getcwd())
+    base_provider, _inst, provider = resolve_provider_key(
+        raw_provider, work_dir, allowed_bases=set(PROVIDER_COMMANDS.keys())
+    )
+
+    if base_provider not in PROVIDER_COMMANDS:
+        print(f"[ERROR] Unknown provider: {raw_provider}", file=sys.stderr)
         print(f"[ERROR] Available: {', '.join(sorted(PROVIDER_COMMANDS.keys()))}", file=sys.stderr)
         return EXIT_ERROR
 
     # Get current project ID
-    work_dir = Path(os.getcwd())
     try:
         project_id = compute_ccb_project_id(work_dir)
     except Exception as e:
         print(f"[ERROR] Failed to compute project ID: {e}", file=sys.stderr)
         return EXIT_ERROR
 
-    # Load registry for this project and provider
+    # Load registry for this project and provider (with session-file fallback for aliased instances)
     record = load_registry_by_project_id(project_id, provider)
-    if not record:
-        print(f"[ERROR] No active {provider} session found for this project.", file=sys.stderr)
-        return EXIT_ERROR
-
-    # Get provider's pane_id
-    providers_map = _get_providers_map(record)
-    provider_entry = providers_map.get(provider, {})
-    pane_id = str(provider_entry.get("pane_id") or "").strip()
+    pane_id = ""
+    if record:
+        providers_map = _get_providers_map(record)
+        provider_entry = providers_map.get(provider, {})
+        pane_id = str(provider_entry.get("pane_id") or "").strip()
 
     if not pane_id:
-        print(f"[ERROR] No pane_id found for {provider}.", file=sys.stderr)
+        sf = find_project_session_file(work_dir, session_filename_for_provider(provider))
+        if sf and sf.is_file():
+            import json
+            try:
+                sdata = json.loads(sf.read_text(encoding="utf-8-sig"))
+                pane_id = str(sdata.get("pane_id") or sdata.get("tmux_session") or "").strip()
+                if not record:
+                    record = sdata
+            except Exception:
+                pass
+
+    if not record or not pane_id:
+        print(f"[ERROR] No active {provider} session found for this project.", file=sys.stderr)
         return EXIT_ERROR
 
     # Get terminal backend
@@ -102,7 +117,7 @@ def main(argv: list[str]) -> int:
         return EXIT_ERROR
 
     # Send reset command to the pane
-    reset_cmd = PROVIDER_COMMANDS[provider]
+    reset_cmd = PROVIDER_COMMANDS[base_provider]
     try:
         backend.send_text(pane_id, reset_cmd)
         print(f"Sent {reset_cmd} to {provider} (pane: {pane_id})")

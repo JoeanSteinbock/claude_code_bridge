@@ -21,7 +21,7 @@ COMPLETION_PATTERNS = [
     r"CCB_DONE",
     r"^\s*>\s*$",  # Claude prompt
     r"^\s*codex>\s*$",  # Codex prompt
-    r"^\s*gemini>\s*$",  # Gemini prompt
+    r"^\s*(?:gemini|agy)>\s*$",  # Gemini/AGY prompt
     r"^\s*claude>\s*$",  # Claude prompt variant
 ]
 

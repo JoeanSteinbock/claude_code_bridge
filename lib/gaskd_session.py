@@ -124,6 +124,22 @@ class GeminiProjectSession:
 
         if self.terminal == "tmux":
             start_cmd = self.start_cmd
+            if start_cmd and "--yolo" in start_cmd:
+                try:
+                    from gemini_comm import is_agy_cli
+                    if is_agy_cli("gemini"):
+                        start_cmd = start_cmd.replace("--yolo", "--dangerously-skip-permissions")
+                        self.data["start_cmd"] = start_cmd
+                except Exception:
+                    pass
+            if start_cmd and "--resume latest" in start_cmd:
+                try:
+                    from gemini_comm import is_agy_cli
+                    if is_agy_cli("gemini"):
+                        start_cmd = start_cmd.replace("--resume latest", "--continue")
+                        self.data["start_cmd"] = start_cmd
+                except Exception:
+                    pass
             respawn = getattr(backend, "respawn_pane", None)
             if start_cmd and callable(respawn):
                 last_err: str | None = None

@@ -4,6 +4,7 @@ ccb (Claude Code Bridge) - Unified AI Launcher
 Supports Claude + Codex / Claude + Gemini / all three simultaneously
 Supports tmux and WezTerm
 """
+from __future__ import annotations
 
 import sys
 import os
@@ -40,11 +41,26 @@ from session_utils import (
 )
 from pane_registry import upsert_registry, load_registry_by_project_id
 from project_id import compute_ccb_project_id
-from providers import CASK_CLIENT_SPEC, GASK_CLIENT_SPEC, OASK_CLIENT_SPEC, LASK_CLIENT_SPEC, DASK_CLIENT_SPEC, RASK_CLIENT_SPEC
+from providers import (
+    CASK_CLIENT_SPEC,
+    GASK_CLIENT_SPEC,
+    OASK_CLIENT_SPEC,
+    LASK_CLIENT_SPEC,
+    DASK_CLIENT_SPEC,
+    RASK_CLIENT_SPEC,
+    display_provider_name,
+    make_qualified_key,
+    normalize_provider_token,
+    parse_qualified_provider,
+    resolve_provider_key,
+    session_filename_for_instance,
+    session_filename_for_provider,
+)
 from process_lock import ProviderLock
 from askd_rpc import shutdown_daemon, read_state
 from askd_runtime import state_file_path
 from i18n import t
+from gemini_comm import is_agy_cli, find_gemini_cmd
 
 setup_windows_encoding()
 
@@ -617,24 +633,77 @@ class AILauncher:
             env["CCB_RUN_DIR"] = os.environ["CCB_RUN_DIR"]
         return env
 
+    def _split_provider(self, provider: str) -> tuple[str, str | None, str]:
+        base, inst = parse_qualified_provider(provider)
+        return base, inst, make_qualified_key(base, inst)
+
+    def _has_base_provider(self, base_name: str) -> bool:
+        target = (base_name or "").strip().lower()
+        return any(parse_qualified_provider(p)[0] == target for p in self.providers)
+
+    def _runtime_subdir(self, provider: str) -> Path:
+        base, inst, _ = self._split_provider(provider)
+        sub = f"{base}-{inst}" if inst else base
+        return self.runtime_dir / sub
+
+    def _pane_title_marker(self, provider: str) -> str:
+        base, inst, _ = self._split_provider(provider)
+        base_label = {
+            "codex": "Codex",
+            "gemini": "Gemini",
+            "opencode": "OpenCode",
+            "claude": "Claude",
+            "droid": "Droid",
+            "grok": "Grok",
+        }.get(base, base.capitalize())
+        if inst:
+            return f"CCB-{base_label}-{inst}-{self.project_id[:8]}"
+        return f"CCB-{base_label}-{self.project_id[:8]}"
+
+    def _agent_labels(self, provider: str) -> tuple[str, str]:
+        base, inst, _ = self._split_provider(provider)
+        base_label = {
+            "codex": "Codex",
+            "gemini": "Gemini",
+            "opencode": "OpenCode",
+            "claude": "Claude",
+            "droid": "Droid",
+            "grok": "Grok",
+        }.get(base, base.capitalize())
+        if inst:
+            return f"{base_label}:{inst}", base_label
+        return base_label, base_label
+
+    def _apply_tmux_pane_identity(self, backend: TmuxBackend, pane_id: str, provider: str) -> str:
+        marker = self._pane_title_marker(provider)
+        agent_label, base_label = self._agent_labels(provider)
+        backend.set_pane_title(pane_id, marker)
+        backend.set_pane_user_option(pane_id, "@ccb_agent", agent_label)
+        backend.set_pane_user_option(pane_id, "@ccb_agent_base", base_label)
+        return marker
+
     def _provider_env_overrides(self, provider: str) -> dict:
         """Managed env + explicit caller marker for the pane/provider process."""
         env = self._managed_env_overrides()
-        prov = (provider or "").strip().lower()
-        if prov in {"claude", "codex", "gemini", "opencode", "droid", "grok", "email", "manual"}:
-            env["CCB_CALLER"] = prov
+        base, inst, qualified = self._split_provider(provider)
+        if base in {"claude", "codex", "gemini", "opencode", "droid", "grok", "email", "manual"}:
+            env["CCB_CALLER"] = qualified
         # Many provider CLIs use `update-notifier` (npm pkg) which can pop a
         # "new version available — update?" prompt on startup. That prompt
         # blocks tmux-driven unattended restarts the same way Claude's
         # resume prompt does. Suppressing it globally for provider panes:
-        if prov in {"codex", "opencode", "gemini", "droid"}:
+        if base in {"codex", "opencode", "gemini", "droid"}:
             env.setdefault("NO_UPDATE_NOTIFIER", "1")
-        # Merge per-provider launch_env from config.
-        extra = self.launch_env.get(prov)
-        if isinstance(extra, dict):
-            for k, v in extra.items():
-                if isinstance(k, str) and k.strip():
-                    env[k.strip()] = str(v)
+        # Merge per-provider launch_env from config (base first, then instance/qualified override).
+        keys = [base, qualified, inst] if inst else [base]
+        for key in keys:
+            if not key:
+                continue
+            extra = self.launch_env.get(key)
+            if isinstance(extra, dict):
+                for k, v in extra.items():
+                    if isinstance(k, str) and k.strip():
+                        env[k.strip()] = str(v)
         return env
 
     def _project_config_dir(self) -> Path:
@@ -816,9 +885,7 @@ class AILauncher:
         try:
             backend = TmuxBackend()
             pane_id = backend.get_current_pane_id()
-            title = f"CCB-{provider.capitalize()}-{self.project_id[:8]}"
-            backend.set_pane_title(pane_id, title)
-            backend.set_pane_user_option(pane_id, "@ccb_agent", provider.capitalize())
+            self._apply_tmux_pane_identity(backend, pane_id, provider)
         except Exception:
             pass
 
@@ -840,7 +907,7 @@ class AILauncher:
         """Start unified askd daemon (provider-agnostic)."""
         # Try to start for any enabled provider that uses askd (including claude)
         for provider in ["codex", "gemini", "opencode", "droid", "claude", "grok"]:
-            if provider in [p.lower() for p in self.providers]:
+            if self._has_base_provider(provider):
                 # Try to start and check if successful
                 self._maybe_start_provider_daemon(provider, quiet=quiet)
                 # Verify daemon actually started by pinging
@@ -910,7 +977,7 @@ class AILauncher:
                 return
             print(msg, file=sys.stderr if err else sys.stdout)
 
-        provider = (provider or "").strip().lower()
+        base_provider, _inst, _qual = self._split_provider(provider)
         specs = {
             "codex": CASK_CLIENT_SPEC,
             "gemini": GASK_CLIENT_SPEC,
@@ -919,10 +986,10 @@ class AILauncher:
             "droid": DASK_CLIENT_SPEC,
             "grok": RASK_CLIENT_SPEC,
         }
-        spec = specs.get(provider)
+        spec = specs.get(base_provider)
         if not spec:
             return
-        if provider not in [p.lower() for p in self.providers]:
+        if not self._has_base_provider(base_provider):
             return
 
         autostart = _bool_from_env(spec.autostart_env_primary)
@@ -1258,7 +1325,9 @@ class AILauncher:
             return
         if not os.environ.get("TMUX"):
             return
-        script = Path.home() / ".local" / "bin" / ("ccb-tmux-on.sh" if active else "ccb-tmux-off.sh")
+        script = self.script_dir / "config" / ("ccb-tmux-on.sh" if active else "ccb-tmux-off.sh")
+        if not script.exists():
+            script = Path.home() / ".local" / "bin" / ("ccb-tmux-on.sh" if active else "ccb-tmux-off.sh")
         if not script.exists():
             return
         try:
@@ -1301,6 +1370,9 @@ class AILauncher:
         return True
 
     def _start_provider(self, provider: str, *, parent_pane: str | None = None, direction: str | None = None) -> str | None:
+        base_provider, _inst, qualified = self._split_provider(provider)
+        disp = display_provider_name(qualified)
+
         # Handle case when no terminal detected
         if self.terminal_type is None:
             print(f"❌ {t('no_terminal_backend')}")
@@ -1314,16 +1386,16 @@ class AILauncher:
 
         # WezTerm mode: no tmux dependency
         if self.terminal_type == "wezterm":
-            print(f"🚀 {t('starting_backend', provider=provider.capitalize(), terminal='wezterm')}")
-            return self._start_provider_wezterm(provider, parent_pane=parent_pane, direction=direction)
+            print(f"🚀 {t('starting_backend', provider=disp, terminal='wezterm')}")
+            return self._start_provider_wezterm(qualified, parent_pane=parent_pane, direction=direction)
 
         # tmux mode: check if tmux is available
         if not shutil.which("tmux"):
             # Try fallback to WezTerm
             if detect_terminal() == "wezterm":
                 self.terminal_type = "wezterm"
-                print(f"🚀 {t('starting_backend', provider=provider.capitalize(), terminal='wezterm - tmux unavailable')}")
-                return self._start_provider_wezterm(provider, parent_pane=parent_pane, direction=direction)
+                print(f"🚀 {t('starting_backend', provider=disp, terminal='wezterm - tmux unavailable')}")
+                return self._start_provider_wezterm(qualified, parent_pane=parent_pane, direction=direction)
             else:
                 print(f"❌ {t('tmux_not_installed')}")
                 print(f"   {t('install_wezterm_or_tmux')}")
@@ -1336,18 +1408,18 @@ class AILauncher:
             print(f"   Then: {' '.join(['ccb', *sys.argv[1:]])}", file=sys.stderr)
             return None
 
-        print(f"🚀 {t('starting_backend', provider=provider.capitalize(), terminal='tmux')}")
+        print(f"🚀 {t('starting_backend', provider=disp, terminal='tmux')}")
 
-        if provider == "codex":
-            return self._start_codex_tmux(parent_pane=parent_pane, direction=direction)
-        elif provider == "gemini":
-            return self._start_gemini_tmux(parent_pane=parent_pane, direction=direction)
-        elif provider == "opencode":
-            return self._start_opencode_tmux(parent_pane=parent_pane, direction=direction)
-        elif provider == "droid":
-            return self._start_droid_tmux(parent_pane=parent_pane, direction=direction)
-        elif provider == "grok":
-            return self._start_grok_tmux(parent_pane=parent_pane, direction=direction)
+        if base_provider == "codex":
+            return self._start_codex_tmux(parent_pane=parent_pane, direction=direction, provider=qualified)
+        elif base_provider == "gemini":
+            return self._start_gemini_tmux(parent_pane=parent_pane, direction=direction, provider=qualified)
+        elif base_provider == "opencode":
+            return self._start_opencode_tmux(parent_pane=parent_pane, direction=direction, provider=qualified)
+        elif base_provider == "droid":
+            return self._start_droid_tmux(parent_pane=parent_pane, direction=direction, provider=qualified)
+        elif base_provider == "grok":
+            return self._start_grok_tmux(parent_pane=parent_pane, direction=direction, provider=qualified)
         else:
             print(f"❌ {t('unknown_provider', provider=provider)}")
             return None
@@ -1359,13 +1431,15 @@ class AILauncher:
         parent_pane: str | None = None,
         direction: str | None = None,
     ) -> str | None:
-        runtime = self.runtime_dir / provider
+        base_provider, _inst, qualified = self._split_provider(provider)
+        disp = display_provider_name(qualified)
+        runtime = self._runtime_subdir(qualified)
         runtime.mkdir(parents=True, exist_ok=True)
 
-        start_cmd = self._get_start_cmd(provider)
+        start_cmd = self._get_start_cmd(qualified)
         keep_open = os.environ.get("CODEX_WEZTERM_KEEP_OPEN", "1").lower() not in {"0", "false", "no", "off"}
         if keep_open:
-            start_cmd = _build_keep_open_cmd(provider, start_cmd)
+            start_cmd = _build_keep_open_cmd(qualified, start_cmd)
         use_direction = (direction or ("right" if not self.wezterm_panes else "bottom")).strip() or "right"
         use_parent = parent_pane
         if not use_parent and use_direction == "bottom":
@@ -1374,15 +1448,15 @@ class AILauncher:
             except StopIteration:
                 use_parent = None
 
-        pane_title_marker = f"CCB-{provider.capitalize()}-{self.project_id[:8]}"
+        pane_title_marker = self._pane_title_marker(qualified)
         title_cmd = _build_pane_title_cmd(pane_title_marker)
-        env_overrides = self._provider_env_overrides(provider)
+        env_overrides = self._provider_env_overrides(qualified)
         full_cmd = title_cmd + self._build_env_prefix(env_overrides) + _build_export_path_cmd(self.script_dir / "bin") + start_cmd
         backend = WeztermBackend()
         pane_id = backend.create_pane(full_cmd, str(Path.cwd()), direction=use_direction, percent=50, parent_pane=use_parent)
-        self.wezterm_panes[provider] = pane_id
+        self.wezterm_panes[qualified] = pane_id
 
-        if provider == "codex":
+        if base_provider == "codex":
             input_fifo = runtime / "input.fifo"
             output_fifo = runtime / "output.fifo"
             # WezTerm mode injects text via pane, no strong FIFO dependency; Windows/WSL may not support mkfifo
@@ -1394,20 +1468,21 @@ class AILauncher:
                 pane_id=pane_id,
                 pane_title_marker=pane_title_marker,
                 codex_start_cmd=start_cmd,
+                provider=qualified,
             )
-        elif provider == "gemini":
-            self._write_gemini_session(runtime, None, pane_id=pane_id, pane_title_marker=pane_title_marker, start_cmd=start_cmd)
-        elif provider == "opencode":
-            self._write_opencode_session(runtime, None, pane_id=pane_id, pane_title_marker=pane_title_marker, start_cmd=start_cmd)
-        elif provider == "droid":
-            self._write_droid_session(runtime, None, pane_id=pane_id, pane_title_marker=pane_title_marker, start_cmd=start_cmd)
-        elif provider == "grok":
-            self._write_grok_session(runtime, None, pane_id=pane_id, pane_title_marker=pane_title_marker, start_cmd=start_cmd)
+        elif base_provider == "gemini":
+            self._write_gemini_session(runtime, None, pane_id=pane_id, pane_title_marker=pane_title_marker, start_cmd=start_cmd, provider=qualified)
+        elif base_provider == "opencode":
+            self._write_opencode_session(runtime, None, pane_id=pane_id, pane_title_marker=pane_title_marker, start_cmd=start_cmd, provider=qualified)
+        elif base_provider == "droid":
+            self._write_droid_session(runtime, None, pane_id=pane_id, pane_title_marker=pane_title_marker, start_cmd=start_cmd, provider=qualified)
+        elif base_provider == "grok":
+            self._write_grok_session(runtime, None, pane_id=pane_id, pane_title_marker=pane_title_marker, start_cmd=start_cmd, provider=qualified)
         else:
             print(f"❌ {t('unknown_provider', provider=provider)}")
             return None
 
-        print(f"✅ {t('started_backend', provider=provider.capitalize(), terminal='wezterm pane', pane_id=pane_id)}")
+        print(f"✅ {t('started_backend', provider=disp, terminal='wezterm pane', pane_id=pane_id)}")
         return pane_id
 
     def _work_dir_strings(self, work_dir: Path) -> list[str]:
@@ -1474,8 +1549,9 @@ class AILauncher:
             print(f"⚠️ codex_session_clear_failed: {exc}", file=sys.stderr)
             return data if isinstance(data, dict) else {}
 
-    def _claude_session_file(self) -> Path:
-        return self._project_session_file(".claude-session")
+    def _claude_session_file(self, provider: str = "claude") -> Path:
+        _base, inst, _qual = self._split_provider(provider)
+        return self._project_session_file(session_filename_for_instance(".claude-session", inst))
 
     def _backfill_claude_session_work_dir_fields(self) -> None:
         path = self._claude_session_file()
@@ -1498,8 +1574,8 @@ class AILauncher:
         payload = json.dumps(data, ensure_ascii=False, indent=2)
         safe_write_session(path, payload)
 
-    def _read_local_claude_session_id(self) -> str | None:
-        data = self._read_json_file(self._claude_session_file())
+    def _read_local_claude_session_id(self, provider: str = "claude") -> str | None:
+        data = self._read_json_file(self._claude_session_file(provider))
         sid = data.get("claude_session_id")
         if not sid:
             legacy = data.get("session_id")
@@ -1530,8 +1606,10 @@ class AILauncher:
         pane_title_marker: str | None = None,
         terminal: str | None = None,
         start_cmd: str | None = None,
+        provider: str = "claude",
     ) -> None:
-        path = self._claude_session_file()
+        _base, inst, qualified = self._split_provider(provider)
+        path = self._claude_session_file(qualified)
         writable, reason, fix = check_session_writable(path)
         if not writable:
             print(f"❌ Cannot write {path.name}: {reason}", file=sys.stderr)
@@ -1544,6 +1622,9 @@ class AILauncher:
         if session_id:
             data["claude_session_id"] = session_id
         data["session_id"] = self.session_id
+        data["provider"] = qualified
+        if inst:
+            data["instance"] = inst
         try:
             data["ccb_project_id"] = compute_ccb_project_id(work_dir)
         except Exception:
@@ -1576,7 +1657,7 @@ class AILauncher:
                         "work_dir": str(self.project_root),
                         "terminal": terminal or self.terminal_type,
                         "providers": {
-                            "claude": {
+                            qualified: {
                                 "pane_id": pane_id,
                                 "pane_title_marker": pane_title_marker,
                                 "session_file": str(path),
@@ -1588,7 +1669,7 @@ class AILauncher:
                 )
             except Exception:
                 pass
-        self._maybe_start_provider_daemon("claude")
+        self._maybe_start_provider_daemon(qualified)
 
     def _get_latest_codex_session_id(self) -> tuple[str | None, bool]:
         """
@@ -1907,8 +1988,9 @@ class AILauncher:
 
     def _get_latest_gemini_project_hash(self) -> tuple[str | None, bool, Path | None]:
         """
-        Returns (project_hash, has_any_history_for_cwd).
+        Returns (project_hash, has_any_history_for_cwd, resume_dir).
         Gemini CLI stores sessions under ~/.gemini/tmp/<sha256(cwd)>/chats/.
+        Antigravity CLI (agy) stores sessions in ~/.gemini/antigravity-cli/.
         """
         import hashlib
 
@@ -1964,32 +2046,105 @@ class AILauncher:
                         resume_dir = None
                     return dir_name, True, resume_dir
 
+        # Check agy (Google Antigravity CLI) history
+        candidate_resolved_set: set[Path] = set()
+        for c in candidates:
+            if not c:
+                continue
+            try:
+                p = Path(c).resolve()
+                if p.is_dir():
+                    candidate_resolved_set.add(p)
+            except Exception:
+                pass
+
+        agy_root = Path.home() / ".gemini" / "antigravity-cli"
+        agy_history = agy_root / "history.jsonl"
+        if agy_history.is_file():
+            try:
+                for line in agy_history.read_text(encoding="utf-8", errors="replace").splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                    except Exception:
+                        continue
+                    ws = entry.get("workspace")
+                    if isinstance(ws, str) and ws.strip():
+                        try:
+                            ws_path = Path(ws).resolve()
+                            if ws_path in candidate_resolved_set:
+                                return None, True, ws_path
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+        agy_db = agy_root / "conversation_summaries.db"
+        if agy_db.is_file():
+            try:
+                import sqlite3
+                conn = sqlite3.connect(str(agy_db))
+                try:
+                    for (ws_uris,) in conn.execute("SELECT workspace_uris FROM conversation_summaries"):
+                        if not ws_uris:
+                            continue
+                        try:
+                            uris = json.loads(ws_uris)
+                            if isinstance(uris, list):
+                                for u in uris:
+                                    clean_p = str(u).replace("file://", "")
+                                    ws_path = Path(clean_p).resolve()
+                                    if ws_path in candidate_resolved_set:
+                                        return None, True, ws_path
+                        except Exception:
+                            continue
+                finally:
+                    conn.close()
+            except Exception:
+                pass
+
         return None, False, None
 
+    def _find_gemini_cmd(self) -> str:
+        return find_gemini_cmd()
+
     def _build_gemini_start_cmd(self) -> str:
-        cmd = "gemini --yolo" if self.auto else "gemini"
+        base_cmd = self._find_gemini_cmd()
+        is_agy = is_agy_cli(base_cmd)
+        if self.auto:
+            auto_flag = "--dangerously-skip-permissions" if is_agy else "--yolo"
+            cmd = f"{base_cmd} {auto_flag}"
+        else:
+            cmd = base_cmd
+
         if self.resume:
             _, has_history, resume_dir = self._get_latest_gemini_project_hash()
             if has_history:
+                resume_flag = "--continue" if is_agy else "--resume latest"
                 if resume_dir:
-                    cmd = f"{_build_cd_cmd(resume_dir)}{cmd} --resume latest"
+                    cmd = f"{_build_cd_cmd(resume_dir)}{cmd} {resume_flag}"
                 else:
-                    cmd = f"{cmd} --resume latest"
-                print(f"🔁 {t('resuming_session', provider='Gemini', session_id='')}")
+                    cmd = f"{cmd} {resume_flag}"
+                provider_display = "AGY" if is_agy else "Gemini"
+                print(f"🔁 {t('resuming_session', provider=provider_display, session_id='')}")
             else:
-                print(f"ℹ️ {t('no_history_fresh', provider='Gemini')}")
+                provider_display = "AGY" if is_agy else "Gemini"
+                print(f"ℹ️ {t('no_history_fresh', provider=provider_display)}")
         return cmd
 
     def _warmup_provider(self, provider: str, timeout: float = 8.0) -> bool:
-        if provider == "gemini":
+        base_provider, _inst, qualified = self._split_provider(provider)
+        if base_provider == "gemini":
             return True
-        if provider == "codex":
+        if base_provider == "codex":
             ping_script = self.script_dir / "bin" / "cping"
-        elif provider == "gemini":
+        elif base_provider == "gemini":
             ping_script = self.script_dir / "bin" / "gping"
-        elif provider == "opencode":
+        elif base_provider == "opencode":
             ping_script = self.script_dir / "bin" / "oping"
-        elif provider == "droid":
+        elif base_provider == "droid":
             ping_script = self.script_dir / "bin" / "dping"
         else:
             return False
@@ -1997,7 +2152,11 @@ class AILauncher:
         if not ping_script.exists():
             return False
 
-        print(f"🔧 Warmup: {ping_script.name}")
+        session_file = self._project_session_file(session_filename_for_provider(qualified))
+        ping_env = os.environ.copy()
+        ping_env["CCB_SESSION_FILE"] = str(session_file)
+
+        print(f"🔧 Warmup: {ping_script.name} ({qualified})")
         deadline = time.time() + timeout
         last_result: subprocess.CompletedProcess[str] | None = None
         sleep_s = 0.3
@@ -2005,6 +2164,7 @@ class AILauncher:
             last_result = subprocess.run(
                 [sys.executable, str(ping_script)],
                 cwd=str(Path.cwd()),
+                env=ping_env,
                 capture_output=True,
                 text=True,
                 encoding='utf-8',
@@ -2022,28 +2182,38 @@ class AILauncher:
             out = ((last_result.stdout or "") + "\n" + (last_result.stderr or "")).strip()
             if out:
                 print(out)
-        print(f"⚠️ Warmup failed: {provider}")
+        print(f"⚠️ Warmup failed: {qualified}")
         return False
 
     def _get_start_cmd(self, provider: str) -> str:
-        if provider == "codex":
+        base_provider, inst, qualified = self._split_provider(provider)
+        if base_provider == "codex":
             # NOTE: Codex TUI has paste-burst detection; terminal injection (wezterm send-text/tmux paste-buffer)
             # is often detected as "paste", causing Enter to only line-break not submit. Disable detection by default.
             cmd = self._build_codex_start_cmd()
-        elif provider == "gemini":
+        elif base_provider == "gemini":
             cmd = self._build_gemini_start_cmd()
-        elif provider == "opencode":
-            cmd = self._build_opencode_start_cmd()
-        elif provider == "droid":
+        elif base_provider == "opencode":
+            cmd = self._build_opencode_start_cmd(qualified)
+        elif base_provider == "droid":
             cmd = self._build_droid_start_cmd()
-        elif provider == "grok":
+        elif base_provider == "grok":
             cmd = self._build_grok_start_cmd()
         else:
             cmd = ""
-        # Append per-provider launch_args from config.
-        extra = self.launch_args.get(provider)
+        # Append per-provider launch_args from config (prefer instance/qualified key, fall back to base).
+        extra = self.launch_args.get(qualified)
+        if not extra and inst:
+            extra = self.launch_args.get(inst)
+        if not extra:
+            extra = self.launch_args.get(base_provider)
+        if not extra and base_provider == "gemini":
+            extra = self.launch_args.get("agy")
         if isinstance(extra, str) and extra.strip():
-            cmd = f"{cmd} {extra.strip()}" if cmd else extra.strip()
+            extra_str = extra.strip()
+            if base_provider == "gemini" and "--yolo" in extra_str and is_agy_cli(cmd):
+                extra_str = extra_str.replace("--yolo", "--dangerously-skip-permissions")
+            cmd = f"{cmd} {extra_str}" if cmd else extra_str
         return cmd
 
     def _opencode_resume_allowed(self) -> bool:
@@ -2155,21 +2325,34 @@ class AILauncher:
 
         return False
 
-    def _build_opencode_start_cmd(self) -> str:
+    def _build_opencode_start_cmd(self, provider: str = "opencode") -> str:
         # OpenCode CLI (TUI). Allow override via env for custom wrappers.
         cmd = (os.environ.get("OPENCODE_START_CMD") or "opencode").strip() or "opencode"
+        _base, inst, qualified = self._split_provider(provider)
+        disp = display_provider_name(qualified)
 
         # Auto mode: relax permissions and enable web tools via config file.
         if self.auto:
             self._ensure_opencode_auto_config()
 
-        # Resume mode: continue last session
+        # Resume mode: continue bound session (if recorded for this instance) or last session
         if self.resume:
-            if self._opencode_resume_allowed():
+            session_file = self._project_session_file(session_filename_for_provider(qualified))
+            saved_sid = ""
+            if session_file.exists():
+                try:
+                    sdata = self._read_json_file(session_file)
+                    saved_sid = str(sdata.get("opencode_session_id") or "").strip()
+                except Exception:
+                    saved_sid = ""
+            if saved_sid and saved_sid.startswith("ses_"):
+                cmd = f"{cmd} --session {shlex.quote(saved_sid)}"
+                print(f"🔁 {t('resuming_session', provider=disp, session_id=saved_sid[:12])}")
+            elif not inst and self._opencode_resume_allowed():
                 cmd = f"{cmd} --continue"
-                print(f"🔁 {t('resuming_session', provider='OpenCode', session_id='')}")
+                print(f"🔁 {t('resuming_session', provider=disp, session_id='')}")
             else:
-                print(f"ℹ️ {t('no_history_fresh', provider='OpenCode')}")
+                print(f"ℹ️ {t('no_history_fresh', provider=disp)}")
 
         return cmd
 
@@ -2271,8 +2454,11 @@ class AILauncher:
         *,
         parent_pane: str | None = None,
         direction: str | None = None,
+        provider: str = "codex",
     ) -> str | None:
-        runtime = self.runtime_dir / "codex"
+        _base, _inst, qualified = self._split_provider(provider)
+        disp = display_provider_name(qualified)
+        runtime = self._runtime_subdir(qualified)
         runtime.mkdir(parents=True, exist_ok=True)
 
         input_fifo = runtime / "input.fifo"
@@ -2283,9 +2469,8 @@ class AILauncher:
         if not output_fifo.exists():
             os.mkfifo(output_fifo, 0o644)
 
-        env_overrides = self._provider_env_overrides("codex")
-        start_cmd = self._build_env_prefix(env_overrides) + _build_export_path_cmd(self.script_dir / "bin") + self._build_codex_start_cmd()
-        pane_title_marker = f"CCB-Codex-{self.project_id[:8]}"
+        env_overrides = self._provider_env_overrides(qualified)
+        start_cmd = self._build_env_prefix(env_overrides) + _build_export_path_cmd(self.script_dir / "bin") + self._get_start_cmd(qualified)
 
         backend = TmuxBackend()
 
@@ -2309,10 +2494,9 @@ class AILauncher:
 
         pane_id = backend.create_pane("", str(Path.cwd()), direction=use_direction, percent=50, parent_pane=use_parent)
         backend.respawn_pane(pane_id, cmd=start_cmd, cwd=str(Path.cwd()), remain_on_exit=True)
-        backend.set_pane_title(pane_id, pane_title_marker)
-        backend.set_pane_user_option(pane_id, "@ccb_agent", "Codex")
+        pane_title_marker = self._apply_tmux_pane_identity(backend, pane_id, qualified)
 
-        self.tmux_panes["codex"] = pane_id
+        self.tmux_panes[qualified] = pane_id
 
         bridge_script = self.script_dir / "lib" / "codex_dual_bridge.py"
         bridge_env = os.environ.copy()
@@ -2360,9 +2544,10 @@ class AILauncher:
             pane_id=pane_id,
             pane_title_marker=pane_title_marker,
             codex_start_cmd=start_cmd,
+            provider=qualified,
         )
 
-        print(f"✅ {t('started_backend', provider='Codex', terminal='tmux pane', pane_id=pane_id)}")
+        print(f"✅ {t('started_backend', provider=disp, terminal='tmux pane', pane_id=pane_id)}")
         return pane_id
 
     def _start_gemini_tmux(
@@ -2370,13 +2555,15 @@ class AILauncher:
         *,
         parent_pane: str | None = None,
         direction: str | None = None,
+        provider: str = "gemini",
     ) -> str | None:
-        runtime = self.runtime_dir / "gemini"
+        _base, _inst, qualified = self._split_provider(provider)
+        disp = display_provider_name(qualified)
+        runtime = self._runtime_subdir(qualified)
         runtime.mkdir(parents=True, exist_ok=True)
 
-        env_overrides = self._provider_env_overrides("gemini")
-        start_cmd = self._build_env_prefix(env_overrides) + _build_export_path_cmd(self.script_dir / "bin") + self._build_gemini_start_cmd()
-        pane_title_marker = f"CCB-Gemini-{self.project_id[:8]}"
+        env_overrides = self._provider_env_overrides(qualified)
+        start_cmd = self._build_env_prefix(env_overrides) + _build_export_path_cmd(self.script_dir / "bin") + self._get_start_cmd(qualified)
 
         backend = TmuxBackend()
 
@@ -2400,10 +2587,9 @@ class AILauncher:
 
         pane_id = backend.create_pane("", str(Path.cwd()), direction=use_direction, percent=50, parent_pane=use_parent)
         backend.respawn_pane(pane_id, cmd=start_cmd, cwd=str(Path.cwd()), remain_on_exit=True)
-        backend.set_pane_title(pane_id, pane_title_marker)
-        backend.set_pane_user_option(pane_id, "@ccb_agent", "Gemini")
+        pane_title_marker = self._apply_tmux_pane_identity(backend, pane_id, qualified)
 
-        self.tmux_panes["gemini"] = pane_id
+        self.tmux_panes[qualified] = pane_id
 
         self._write_gemini_session(
             runtime,
@@ -2411,9 +2597,10 @@ class AILauncher:
             pane_id=pane_id,
             pane_title_marker=pane_title_marker,
             start_cmd=start_cmd,
+            provider=qualified,
         )
 
-        print(f"✅ {t('started_backend', provider='Gemini', terminal='tmux pane', pane_id=pane_id)}")
+        print(f"✅ {t('started_backend', provider=disp, terminal='tmux pane', pane_id=pane_id)}")
         return pane_id
 
     def _start_opencode_tmux(
@@ -2421,13 +2608,15 @@ class AILauncher:
         *,
         parent_pane: str | None = None,
         direction: str | None = None,
+        provider: str = "opencode",
     ) -> str | None:
-        runtime = self.runtime_dir / "opencode"
+        _base, _inst, qualified = self._split_provider(provider)
+        disp = display_provider_name(qualified)
+        runtime = self._runtime_subdir(qualified)
         runtime.mkdir(parents=True, exist_ok=True)
 
-        env_overrides = self._provider_env_overrides("opencode")
-        start_cmd = self._build_env_prefix(env_overrides) + _build_export_path_cmd(self.script_dir / "bin") + self._build_opencode_start_cmd()
-        pane_title_marker = f"CCB-OpenCode-{self.project_id[:8]}"
+        env_overrides = self._provider_env_overrides(qualified)
+        start_cmd = self._build_env_prefix(env_overrides) + _build_export_path_cmd(self.script_dir / "bin") + self._get_start_cmd(qualified)
 
         backend = TmuxBackend()
 
@@ -2454,10 +2643,9 @@ class AILauncher:
 
         pane_id = backend.create_pane("", str(Path.cwd()), direction=use_direction, percent=50, parent_pane=use_parent)
         backend.respawn_pane(pane_id, cmd=start_cmd, cwd=str(Path.cwd()), remain_on_exit=True)
-        backend.set_pane_title(pane_id, pane_title_marker)
-        backend.set_pane_user_option(pane_id, "@ccb_agent", "OpenCode")
+        pane_title_marker = self._apply_tmux_pane_identity(backend, pane_id, qualified)
 
-        self.tmux_panes["opencode"] = pane_id
+        self.tmux_panes[qualified] = pane_id
 
         self._write_opencode_session(
             runtime,
@@ -2465,9 +2653,10 @@ class AILauncher:
             pane_id=pane_id,
             pane_title_marker=pane_title_marker,
             start_cmd=start_cmd,
+            provider=qualified,
         )
 
-        print(f"✅ {t('started_backend', provider='OpenCode', terminal='tmux pane', pane_id=pane_id)}")
+        print(f"✅ {t('started_backend', provider=disp, terminal='tmux pane', pane_id=pane_id)}")
         return pane_id
 
     def _start_grok_tmux(
@@ -2475,13 +2664,15 @@ class AILauncher:
         *,
         parent_pane: str | None = None,
         direction: str | None = None,
+        provider: str = "grok",
     ) -> str | None:
-        runtime = self.runtime_dir / "grok"
+        _base, _inst, qualified = self._split_provider(provider)
+        disp = display_provider_name(qualified)
+        runtime = self._runtime_subdir(qualified)
         runtime.mkdir(parents=True, exist_ok=True)
 
-        env_overrides = self._provider_env_overrides("grok")
-        start_cmd = self._build_env_prefix(env_overrides) + _build_export_path_cmd(self.script_dir / "bin") + self._build_grok_start_cmd()
-        pane_title_marker = f"CCB-Grok-{self.project_id[:8]}"
+        env_overrides = self._provider_env_overrides(qualified)
+        start_cmd = self._build_env_prefix(env_overrides) + _build_export_path_cmd(self.script_dir / "bin") + self._get_start_cmd(qualified)
 
         backend = TmuxBackend()
 
@@ -2506,10 +2697,9 @@ class AILauncher:
 
         pane_id = backend.create_pane("", str(Path.cwd()), direction=use_direction, percent=50, parent_pane=use_parent)
         backend.respawn_pane(pane_id, cmd=start_cmd, cwd=str(Path.cwd()), remain_on_exit=True)
-        backend.set_pane_title(pane_id, pane_title_marker)
-        backend.set_pane_user_option(pane_id, "@ccb_agent", "Grok")
+        pane_title_marker = self._apply_tmux_pane_identity(backend, pane_id, qualified)
 
-        self.tmux_panes["grok"] = pane_id
+        self.tmux_panes[qualified] = pane_id
 
         self._write_grok_session(
             runtime,
@@ -2517,9 +2707,10 @@ class AILauncher:
             pane_id=pane_id,
             pane_title_marker=pane_title_marker,
             start_cmd=start_cmd,
+            provider=qualified,
         )
 
-        print(f"✅ {t('started_backend', provider='Grok', terminal='tmux pane', pane_id=pane_id)}")
+        print(f"✅ {t('started_backend', provider=disp, terminal='tmux pane', pane_id=pane_id)}")
         return pane_id
 
     def _start_droid_tmux(
@@ -2527,13 +2718,15 @@ class AILauncher:
         *,
         parent_pane: str | None = None,
         direction: str | None = None,
+        provider: str = "droid",
     ) -> str | None:
-        runtime = self.runtime_dir / "droid"
+        _base, _inst, qualified = self._split_provider(provider)
+        disp = display_provider_name(qualified)
+        runtime = self._runtime_subdir(qualified)
         runtime.mkdir(parents=True, exist_ok=True)
 
-        env_overrides = self._provider_env_overrides("droid")
-        start_cmd = self._build_env_prefix(env_overrides) + _build_export_path_cmd(self.script_dir / "bin") + self._build_droid_start_cmd()
-        pane_title_marker = f"CCB-Droid-{self.project_id[:8]}"
+        env_overrides = self._provider_env_overrides(qualified)
+        start_cmd = self._build_env_prefix(env_overrides) + _build_export_path_cmd(self.script_dir / "bin") + self._get_start_cmd(qualified)
 
         backend = TmuxBackend()
 
@@ -2558,10 +2751,9 @@ class AILauncher:
 
         pane_id = backend.create_pane("", str(Path.cwd()), direction=use_direction, percent=50, parent_pane=use_parent)
         backend.respawn_pane(pane_id, cmd=start_cmd, cwd=str(Path.cwd()), remain_on_exit=True)
-        backend.set_pane_title(pane_id, pane_title_marker)
-        backend.set_pane_user_option(pane_id, "@ccb_agent", "Droid")
+        pane_title_marker = self._apply_tmux_pane_identity(backend, pane_id, qualified)
 
-        self.tmux_panes["droid"] = pane_id
+        self.tmux_panes[qualified] = pane_id
 
         self._write_droid_session(
             runtime,
@@ -2569,9 +2761,10 @@ class AILauncher:
             pane_id=pane_id,
             pane_title_marker=pane_title_marker,
             start_cmd=start_cmd,
+            provider=qualified,
         )
 
-        print(f"✅ {t('started_backend', provider='Droid', terminal='tmux pane', pane_id=pane_id)}")
+        print(f"✅ {t('started_backend', provider=disp, terminal='tmux pane', pane_id=pane_id)}")
         return pane_id
 
     def _start_cmd_pane(
@@ -2611,8 +2804,9 @@ class AILauncher:
         print(f"✅ Started cmd pane ({pane_id})")
         return pane_id
 
-    def _start_codex_current_pane(self) -> int:
-        runtime = self.runtime_dir / "codex"
+    def _start_codex_current_pane(self, provider: str = "codex") -> int:
+        _base, _inst, qualified = self._split_provider(provider)
+        runtime = self._runtime_subdir(qualified)
         runtime.mkdir(parents=True, exist_ok=True)
 
         input_fifo = runtime / "input.fifo"
@@ -2623,12 +2817,11 @@ class AILauncher:
             print("❌ Unable to determine current pane id for Codex", file=sys.stderr)
             return 1
 
-        pane_title_marker = f"CCB-Codex-{self.project_id[:8]}"
+        pane_title_marker = self._pane_title_marker(qualified)
         if self.terminal_type == "tmux":
             try:
                 backend = TmuxBackend()
-                backend.set_pane_title(pane_id, pane_title_marker)
-                backend.set_pane_user_option(pane_id, "@ccb_agent", "Codex")
+                pane_title_marker = self._apply_tmux_pane_identity(backend, pane_id, qualified)
             except Exception:
                 pass
 
@@ -2639,11 +2832,12 @@ class AILauncher:
                 os.mkfifo(output_fifo, 0o644)
 
         title_cmd = _build_pane_title_cmd(pane_title_marker) if self.terminal_type == "wezterm" else ""
+        codex_cmd = self._get_start_cmd(qualified)
         start_cmd = (
             title_cmd
-            + self._build_env_prefix(self._provider_env_overrides("codex"))
+            + self._build_env_prefix(self._provider_env_overrides(qualified))
             + _build_export_path_cmd(self.script_dir / "bin")
-            + self._build_codex_start_cmd()
+            + codex_cmd
         )
 
         self._write_codex_session(
@@ -2654,6 +2848,7 @@ class AILauncher:
             pane_id=pane_id,
             pane_title_marker=pane_title_marker,
             codex_start_cmd=start_cmd,
+            provider=qualified,
         )
 
         # Optional: start caskd after Codex session file exists (first startup convenience).
@@ -2688,7 +2883,7 @@ class AILauncher:
         # 因而会触发 [WinError 2] 找不到可执行文件。这里改为通过 shell 执行以确保可启动。
         if os.name == "nt":
             env = self._with_bin_path_env()
-            env.update(self._provider_env_overrides("codex"))
+            env.update(self._provider_env_overrides(qualified))
             env["CODEX_SESSION_ID"] = self.session_id
             env["CODEX_RUNTIME_DIR"] = str(runtime)
             env["CODEX_INPUT_FIFO"] = str(input_fifo)
@@ -2698,11 +2893,11 @@ class AILauncher:
                 env["CODEX_WEZTERM_PANE"] = pane_id
             else:
                 env["CODEX_TMUX_SESSION"] = pane_id
-            return self._run_shell_command(self._build_codex_start_cmd(), env=env, cwd=str(Path.cwd()))
+            return self._run_shell_command(codex_cmd, env=env, cwd=str(Path.cwd()))
 
-        cmd_parts = shlex.split(self._build_codex_start_cmd())
+        cmd_parts = shlex.split(codex_cmd)
         env = self._with_bin_path_env()
-        env.update(self._provider_env_overrides("codex"))
+        env.update(self._provider_env_overrides(qualified))
         env["CODEX_SESSION_ID"] = self.session_id
         env["CODEX_RUNTIME_DIR"] = str(runtime)
         env["CODEX_INPUT_FIFO"] = str(input_fifo)
@@ -2727,8 +2922,9 @@ class AILauncher:
 
         return proc.wait()
 
-    def _start_gemini_current_pane(self) -> int:
-        runtime = self.runtime_dir / "gemini"
+    def _start_gemini_current_pane(self, provider: str = "gemini") -> int:
+        _base, _inst, qualified = self._split_provider(provider)
+        runtime = self._runtime_subdir(qualified)
         runtime.mkdir(parents=True, exist_ok=True)
 
         pane_id = self._current_pane_id()
@@ -2736,21 +2932,20 @@ class AILauncher:
             print("❌ Unable to determine current pane id for Gemini", file=sys.stderr)
             return 1
 
-        pane_title_marker = f"CCB-Gemini-{self.project_id[:8]}"
+        pane_title_marker = self._pane_title_marker(qualified)
         if self.terminal_type == "tmux":
             try:
                 backend = TmuxBackend()
-                backend.set_pane_title(pane_id, pane_title_marker)
-                backend.set_pane_user_option(pane_id, "@ccb_agent", "Gemini")
+                pane_title_marker = self._apply_tmux_pane_identity(backend, pane_id, qualified)
             except Exception:
                 pass
 
         title_cmd = _build_pane_title_cmd(pane_title_marker) if self.terminal_type == "wezterm" else ""
         start_cmd = (
             title_cmd
-            + self._build_env_prefix(self._provider_env_overrides("gemini"))
+            + self._build_env_prefix(self._provider_env_overrides(qualified))
             + _build_export_path_cmd(self.script_dir / "bin")
-            + self._build_gemini_start_cmd()
+            + self._get_start_cmd(qualified)
         )
         self._write_gemini_session(
             runtime,
@@ -2758,12 +2953,14 @@ class AILauncher:
             pane_id=pane_id,
             pane_title_marker=pane_title_marker,
             start_cmd=start_cmd,
+            provider=qualified,
         )
 
         return self._run_shell_command(start_cmd, cwd=str(Path.cwd()))
 
-    def _start_opencode_current_pane(self) -> int:
-        runtime = self.runtime_dir / "opencode"
+    def _start_opencode_current_pane(self, provider: str = "opencode") -> int:
+        _base, _inst, qualified = self._split_provider(provider)
+        runtime = self._runtime_subdir(qualified)
         runtime.mkdir(parents=True, exist_ok=True)
 
         pane_id = self._current_pane_id()
@@ -2771,20 +2968,19 @@ class AILauncher:
             print("❌ Unable to determine current pane id for OpenCode", file=sys.stderr)
             return 1
 
-        pane_title_marker = f"CCB-OpenCode-{self.project_id[:8]}"
+        pane_title_marker = self._pane_title_marker(qualified)
         if self.terminal_type == "tmux":
             try:
                 backend = TmuxBackend()
-                backend.set_pane_title(pane_id, pane_title_marker)
-                backend.set_pane_user_option(pane_id, "@ccb_agent", "OpenCode")
+                pane_title_marker = self._apply_tmux_pane_identity(backend, pane_id, qualified)
             except Exception:
                 pass
 
         title_cmd = _build_pane_title_cmd(pane_title_marker) if self.terminal_type == "wezterm" else ""
-        opencode_cmd = self._build_opencode_start_cmd()
+        opencode_cmd = self._get_start_cmd(qualified)
         start_cmd = (
             title_cmd
-            + self._build_env_prefix(self._provider_env_overrides("opencode"))
+            + self._build_env_prefix(self._provider_env_overrides(qualified))
             + _build_export_path_cmd(self.script_dir / "bin")
             + opencode_cmd
         )
@@ -2794,13 +2990,14 @@ class AILauncher:
             pane_id=pane_id,
             pane_title_marker=pane_title_marker,
             start_cmd=start_cmd,
+            provider=qualified,
         )
 
         # tmux path: run OpenCode directly (without shell -lc) to avoid shell startup side-effects
         # that can make the TUI appear to hang before rendering.
         if self.terminal_type == "tmux" and os.name != "nt":
             env = self._with_bin_path_env()
-            env.update(self._provider_env_overrides("opencode"))
+            env.update(self._provider_env_overrides(qualified))
             env["OPENCODE_SESSION_ID"] = self.session_id
             env["OPENCODE_RUNTIME_DIR"] = str(runtime)
             env["OPENCODE_TERMINAL"] = self.terminal_type
@@ -2823,8 +3020,9 @@ class AILauncher:
 
         return self._run_shell_command(start_cmd, cwd=str(Path.cwd()))
 
-    def _start_droid_current_pane(self) -> int:
-        runtime = self.runtime_dir / "droid"
+    def _start_droid_current_pane(self, provider: str = "droid") -> int:
+        _base, _inst, qualified = self._split_provider(provider)
+        runtime = self._runtime_subdir(qualified)
         runtime.mkdir(parents=True, exist_ok=True)
 
         pane_id = self._current_pane_id()
@@ -2832,21 +3030,20 @@ class AILauncher:
             print("❌ Unable to determine current pane id for Droid", file=sys.stderr)
             return 1
 
-        pane_title_marker = f"CCB-Droid-{self.project_id[:8]}"
+        pane_title_marker = self._pane_title_marker(qualified)
         if self.terminal_type == "tmux":
             try:
                 backend = TmuxBackend()
-                backend.set_pane_title(pane_id, pane_title_marker)
-                backend.set_pane_user_option(pane_id, "@ccb_agent", "Droid")
+                pane_title_marker = self._apply_tmux_pane_identity(backend, pane_id, qualified)
             except Exception:
                 pass
 
         title_cmd = _build_pane_title_cmd(pane_title_marker) if self.terminal_type == "wezterm" else ""
         start_cmd = (
             title_cmd
-            + self._build_env_prefix(self._provider_env_overrides("droid"))
+            + self._build_env_prefix(self._provider_env_overrides(qualified))
             + _build_export_path_cmd(self.script_dir / "bin")
-            + self._build_droid_start_cmd()
+            + self._get_start_cmd(qualified)
         )
         self._write_droid_session(
             runtime,
@@ -2854,12 +3051,14 @@ class AILauncher:
             pane_id=pane_id,
             pane_title_marker=pane_title_marker,
             start_cmd=start_cmd,
+            provider=qualified,
         )
 
         return self._run_shell_command(start_cmd, cwd=str(Path.cwd()))
 
-    def _start_grok_current_pane(self) -> int:
-        runtime = self.runtime_dir / "grok"
+    def _start_grok_current_pane(self, provider: str = "grok") -> int:
+        _base, _inst, qualified = self._split_provider(provider)
+        runtime = self._runtime_subdir(qualified)
         runtime.mkdir(parents=True, exist_ok=True)
 
         pane_id = self._current_pane_id()
@@ -2867,21 +3066,20 @@ class AILauncher:
             print("❌ Unable to determine current pane id for Grok", file=sys.stderr)
             return 1
 
-        pane_title_marker = f"CCB-Grok-{self.project_id[:8]}"
+        pane_title_marker = self._pane_title_marker(qualified)
         if self.terminal_type == "tmux":
             try:
                 backend = TmuxBackend()
-                backend.set_pane_title(pane_id, pane_title_marker)
-                backend.set_pane_user_option(pane_id, "@ccb_agent", "Grok")
+                pane_title_marker = self._apply_tmux_pane_identity(backend, pane_id, qualified)
             except Exception:
                 pass
 
         title_cmd = _build_pane_title_cmd(pane_title_marker) if self.terminal_type == "wezterm" else ""
         start_cmd = (
             title_cmd
-            + self._build_env_prefix(self._provider_env_overrides("grok"))
+            + self._build_env_prefix(self._provider_env_overrides(qualified))
             + _build_export_path_cmd(self.script_dir / "bin")
-            + self._build_grok_start_cmd()
+            + self._get_start_cmd(qualified)
         )
         self._write_grok_session(
             runtime,
@@ -2889,28 +3087,41 @@ class AILauncher:
             pane_id=pane_id,
             pane_title_marker=pane_title_marker,
             start_cmd=start_cmd,
+            provider=qualified,
         )
 
         return self._run_shell_command(start_cmd, cwd=str(Path.cwd()))
 
     def _start_provider_in_current_pane(self, provider: str) -> int:
-        if provider == "claude":
-            return self._start_claude()
-        if provider == "codex":
-            return self._start_codex_current_pane()
-        if provider == "gemini":
-            return self._start_gemini_current_pane()
-        if provider == "opencode":
-            return self._start_opencode_current_pane()
-        if provider == "droid":
-            return self._start_droid_current_pane()
-        if provider == "grok":
-            return self._start_grok_current_pane()
+        base_provider, _inst, qualified = self._split_provider(provider)
+        if base_provider == "claude":
+            return self._start_claude(qualified)
+        if base_provider == "codex":
+            return self._start_codex_current_pane(qualified)
+        if base_provider == "gemini":
+            return self._start_gemini_current_pane(qualified)
+        if base_provider == "opencode":
+            return self._start_opencode_current_pane(qualified)
+        if base_provider == "droid":
+            return self._start_droid_current_pane(qualified)
+        if base_provider == "grok":
+            return self._start_grok_current_pane(qualified)
         print(f"❌ {t('unknown_provider', provider=provider)}")
         return 1
 
-    def _write_codex_session(self, runtime, tmux_session, input_fifo, output_fifo, pane_id=None, pane_title_marker=None, codex_start_cmd=None):
-        session_file = self._project_session_file(".codex-session")
+    def _write_codex_session(
+        self,
+        runtime,
+        tmux_session,
+        input_fifo,
+        output_fifo,
+        pane_id=None,
+        pane_title_marker=None,
+        codex_start_cmd=None,
+        provider: str = "codex",
+    ):
+        _base, inst, qualified = self._split_provider(provider)
+        session_file = self._project_session_file(session_filename_for_provider(qualified))
 
         # Pre-check permissions
         writable, reason, fix = check_session_writable(session_file)
@@ -2929,6 +3140,7 @@ class AILauncher:
         work_dir = self.project_root
         data.update({
             "session_id": self.session_id,
+            "provider": qualified,
             "ccb_project_id": compute_ccb_project_id(work_dir),
             "runtime_dir": str(runtime),
             "input_fifo": str(input_fifo),
@@ -2944,6 +3156,8 @@ class AILauncher:
             "active": True,
             "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         })
+        if inst:
+            data["instance"] = inst
         if codex_start_cmd:
             data["codex_start_cmd"] = str(codex_start_cmd)
             data["start_cmd"] = str(codex_start_cmd)
@@ -2959,7 +3173,7 @@ class AILauncher:
                 "work_dir": str(self.project_root),
                 "terminal": self.terminal_type,
                 "providers": {
-                    "codex": {
+                    qualified: {
                         "pane_id": pane_id,
                         "pane_title_marker": pane_title_marker,
                         "session_file": str(session_file),
@@ -2968,7 +3182,7 @@ class AILauncher:
             })
         except Exception:
             pass
-        self._maybe_start_provider_daemon("codex")
+        self._maybe_start_provider_daemon(qualified)
         return True
 
     def _write_cend_registry(self, claude_pane_id: str, codex_pane_id: str | None) -> bool:
@@ -2999,8 +3213,9 @@ class AILauncher:
         if codex_pane_id and claude_pane_id:
             self._write_cend_registry(claude_pane_id, codex_pane_id)
 
-    def _write_gemini_session(self, runtime, tmux_session, pane_id=None, pane_title_marker=None, start_cmd=None):
-        session_file = self._project_session_file(".gemini-session")
+    def _write_gemini_session(self, runtime, tmux_session, pane_id=None, pane_title_marker=None, start_cmd=None, provider: str = "gemini"):
+        _base, inst, qualified = self._split_provider(provider)
+        session_file = self._project_session_file(session_filename_for_provider(qualified))
 
         # Pre-check permissions
         writable, reason, fix = check_session_writable(session_file)
@@ -3011,6 +3226,7 @@ class AILauncher:
 
         data = {
             "session_id": self.session_id,
+            "provider": qualified,
             "ccb_project_id": compute_ccb_project_id(self.project_root),
             "runtime_dir": str(runtime),
             "terminal": self.terminal_type,
@@ -3024,6 +3240,8 @@ class AILauncher:
             "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "start_cmd": str(start_cmd) if start_cmd else None,
         }
+        if inst:
+            data["instance"] = inst
 
         ok, err = safe_write_session(session_file, json.dumps(data, ensure_ascii=False, indent=2))
         if not ok:
@@ -3036,7 +3254,7 @@ class AILauncher:
                 "work_dir": str(self.project_root),
                 "terminal": self.terminal_type,
                 "providers": {
-                    "gemini": {
+                    qualified: {
                         "pane_id": pane_id,
                         "pane_title_marker": pane_title_marker,
                         "session_file": str(session_file),
@@ -3045,11 +3263,71 @@ class AILauncher:
             })
         except Exception:
             pass
-        self._maybe_start_provider_daemon("gemini")
+        self._maybe_start_provider_daemon(qualified)
         return True
 
-    def _write_opencode_session(self, runtime, tmux_session, pane_id=None, pane_title_marker=None, start_cmd=None):
-        session_file = self._project_session_file(".opencode-session")
+    def _write_opencode_session(self, runtime, tmux_session, pane_id=None, pane_title_marker=None, start_cmd=None, provider: str = "opencode"):
+        _base, inst, qualified = self._split_provider(provider)
+        session_file = self._project_session_file(session_filename_for_provider(qualified))
+
+        writable, reason, fix = check_session_writable(session_file)
+        if not writable:
+            print(f"❌ Cannot write {session_file.name}: {reason}", file=sys.stderr)
+            print(f"💡 Fix: {fix}", file=sys.stderr)
+            return False
+
+        prev_data = self._read_json_file(session_file) if (self.resume and session_file.exists()) else {}
+        data = {
+            "session_id": self.session_id,
+            "ccb_session_id": self.session_id,
+            "provider": qualified,
+            "ccb_project_id": compute_ccb_project_id(self.project_root),
+            "runtime_dir": str(runtime),
+            "terminal": self.terminal_type,
+            "tmux_session": tmux_session,
+            "pane_id": pane_id,
+            "pane_title_marker": pane_title_marker,
+            "work_dir": str(self.project_root),
+            "work_dir_norm": _normalize_path_for_match(str(self.project_root)),
+            "start_dir": str(self.invocation_dir),
+            "active": True,
+            "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "start_cmd": str(start_cmd) if start_cmd else None,
+        }
+        if inst:
+            data["instance"] = inst
+        if self.resume:
+            if prev_data.get("opencode_session_id"):
+                data["opencode_session_id"] = prev_data["opencode_session_id"]
+            if prev_data.get("opencode_project_id"):
+                data["opencode_project_id"] = prev_data["opencode_project_id"]
+
+        ok, err = safe_write_session(session_file, json.dumps(data, ensure_ascii=False, indent=2))
+        if not ok:
+            print(err, file=sys.stderr)
+            return False
+        try:
+            upsert_registry({
+                "ccb_session_id": self.session_id,
+                "ccb_project_id": compute_ccb_project_id(self.project_root),
+                "work_dir": str(self.project_root),
+                "terminal": self.terminal_type,
+                "providers": {
+                    qualified: {
+                        "pane_id": pane_id,
+                        "pane_title_marker": pane_title_marker,
+                        "session_file": str(session_file),
+                    }
+                },
+            })
+        except Exception:
+            pass
+        self._maybe_start_provider_daemon(qualified)
+        return True
+
+    def _write_grok_session(self, runtime, tmux_session, pane_id=None, pane_title_marker=None, start_cmd=None, provider: str = "grok"):
+        _base, inst, qualified = self._split_provider(provider)
+        session_file = self._project_session_file(session_filename_for_provider(qualified))
 
         writable, reason, fix = check_session_writable(session_file)
         if not writable:
@@ -3060,6 +3338,7 @@ class AILauncher:
         data = {
             "session_id": self.session_id,
             "ccb_session_id": self.session_id,
+            "provider": qualified,
             "ccb_project_id": compute_ccb_project_id(self.project_root),
             "runtime_dir": str(runtime),
             "terminal": self.terminal_type,
@@ -3073,6 +3352,8 @@ class AILauncher:
             "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "start_cmd": str(start_cmd) if start_cmd else None,
         }
+        if inst:
+            data["instance"] = inst
 
         ok, err = safe_write_session(session_file, json.dumps(data, ensure_ascii=False, indent=2))
         if not ok:
@@ -3085,7 +3366,7 @@ class AILauncher:
                 "work_dir": str(self.project_root),
                 "terminal": self.terminal_type,
                 "providers": {
-                    "opencode": {
+                    qualified: {
                         "pane_id": pane_id,
                         "pane_title_marker": pane_title_marker,
                         "session_file": str(session_file),
@@ -3094,60 +3375,12 @@ class AILauncher:
             })
         except Exception:
             pass
-        self._maybe_start_provider_daemon("opencode")
+        self._maybe_start_provider_daemon(qualified)
         return True
 
-    def _write_grok_session(self, runtime, tmux_session, pane_id=None, pane_title_marker=None, start_cmd=None):
-        session_file = self._project_session_file(".grok-session")
-
-        writable, reason, fix = check_session_writable(session_file)
-        if not writable:
-            print(f"❌ Cannot write {session_file.name}: {reason}", file=sys.stderr)
-            print(f"💡 Fix: {fix}", file=sys.stderr)
-            return False
-
-        data = {
-            "session_id": self.session_id,
-            "ccb_session_id": self.session_id,
-            "ccb_project_id": compute_ccb_project_id(self.project_root),
-            "runtime_dir": str(runtime),
-            "terminal": self.terminal_type,
-            "tmux_session": tmux_session,
-            "pane_id": pane_id,
-            "pane_title_marker": pane_title_marker,
-            "work_dir": str(self.project_root),
-            "work_dir_norm": _normalize_path_for_match(str(self.project_root)),
-            "start_dir": str(self.invocation_dir),
-            "active": True,
-            "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "start_cmd": str(start_cmd) if start_cmd else None,
-        }
-
-        ok, err = safe_write_session(session_file, json.dumps(data, ensure_ascii=False, indent=2))
-        if not ok:
-            print(err, file=sys.stderr)
-            return False
-        try:
-            upsert_registry({
-                "ccb_session_id": self.session_id,
-                "ccb_project_id": compute_ccb_project_id(self.project_root),
-                "work_dir": str(self.project_root),
-                "terminal": self.terminal_type,
-                "providers": {
-                    "grok": {
-                        "pane_id": pane_id,
-                        "pane_title_marker": pane_title_marker,
-                        "session_file": str(session_file),
-                    }
-                },
-            })
-        except Exception:
-            pass
-        self._maybe_start_provider_daemon("grok")
-        return True
-
-    def _write_droid_session(self, runtime, tmux_session, pane_id=None, pane_title_marker=None, start_cmd=None):
-        session_file = self._project_session_file(".droid-session")
+    def _write_droid_session(self, runtime, tmux_session, pane_id=None, pane_title_marker=None, start_cmd=None, provider: str = "droid"):
+        _base, inst, qualified = self._split_provider(provider)
+        session_file = self._project_session_file(session_filename_for_provider(qualified))
 
         writable, reason, fix = check_session_writable(session_file)
         if not writable:
@@ -3173,6 +3406,7 @@ class AILauncher:
         data = {
             "session_id": self.session_id,
             "ccb_session_id": self.session_id,
+            "provider": qualified,
             "ccb_project_id": compute_ccb_project_id(self.project_root),
             "runtime_dir": str(runtime),
             "terminal": self.terminal_type,
@@ -3188,6 +3422,8 @@ class AILauncher:
             "droid_session_id": droid_session_id,
             "droid_session_path": droid_session_path,
         }
+        if inst:
+            data["instance"] = inst
 
         ok, err = safe_write_session(session_file, json.dumps(data, ensure_ascii=False, indent=2))
         if not ok:
@@ -3200,7 +3436,7 @@ class AILauncher:
                 "work_dir": str(self.project_root),
                 "terminal": self.terminal_type,
                 "providers": {
-                    "droid": {
+                    qualified: {
                         "pane_id": pane_id,
                         "pane_title_marker": pane_title_marker,
                         "session_file": str(session_file),
@@ -3211,7 +3447,7 @@ class AILauncher:
             })
         except Exception:
             pass
-        self._maybe_start_provider_daemon("droid")
+        self._maybe_start_provider_daemon(qualified)
         return True
 
     def _claude_project_dir(self, work_dir: Path) -> Path:
@@ -3332,9 +3568,9 @@ class AILauncher:
             "❌ Claude CLI not found. Install: npm install -g @anthropic-ai/claude-code"
         )
 
-    def _claude_env_overrides(self) -> dict:
+    def _claude_env_overrides(self, provider: str = "claude") -> dict:
         env: dict[str, str] = {}
-        env.update(self._provider_env_overrides("claude"))
+        env.update(self._provider_env_overrides(provider))
         if "codex" in self.providers:
             runtime = self.runtime_dir / "codex"
             env["CODEX_SESSION_ID"] = self.session_id
@@ -3383,12 +3619,13 @@ class AILauncher:
 
         return env
 
-    def _build_claude_env(self) -> dict:
+    def _build_claude_env(self, provider: str = "claude") -> dict:
         env = self._with_bin_path_env()
-        env.update(self._claude_env_overrides())
+        env.update(self._claude_env_overrides(provider))
         return env
 
-    def _claude_start_plan(self) -> tuple[list[str], str, bool]:
+    def _claude_start_plan(self, provider: str = "claude") -> tuple[list[str], str, bool]:
+        base_provider, inst, qualified = self._split_provider(provider)
         claude_cmd = self._find_claude_cmd()
         cmd = [claude_cmd]
         if self.auto:
@@ -3396,19 +3633,29 @@ class AILauncher:
         has_history = False
         resume_dir = None
         if self.resume:
-            session_id, has_history, resume_dir = self._get_latest_claude_session_id()
-            if has_history:
-                # Prefer `--resume <id>` over bare `--continue`. `--continue`
-                # can pop an interactive "resume full or with summary?" prompt
-                # when the previous process was killed mid-turn — which
-                # blocks the tmux-driven restart path with no one around to
-                # answer it. Targeting a specific session id sidesteps that.
-                if session_id:
-                    cmd.extend(["--resume", session_id])
-                else:
-                    cmd.append("--continue")
-        # Append per-provider launch_args from config.
-        extra = self.launch_args.get("claude")
+            # Prefer instance-bound claude_session_id if present
+            bound_sid = self._read_local_claude_session_id(qualified) if inst else None
+            if bound_sid:
+                cmd.extend(["--resume", bound_sid])
+                has_history = True
+            else:
+                session_id, has_history, resume_dir = self._get_latest_claude_session_id()
+                if has_history:
+                    # Prefer `--resume <id>` over bare `--continue`. `--continue`
+                    # can pop an interactive "resume full or with summary?" prompt
+                    # when the previous process was killed mid-turn — which
+                    # blocks the tmux-driven restart path with no one around to
+                    # answer it. Targeting a specific session id sidesteps that.
+                    if session_id:
+                        cmd.extend(["--resume", session_id])
+                    else:
+                        cmd.append("--continue")
+        # Append per-provider launch_args from config (prefer instance/qualified key).
+        extra = self.launch_args.get(qualified)
+        if not extra and inst:
+            extra = self.launch_args.get(inst)
+        if not extra:
+            extra = self.launch_args.get(base_provider)
         if isinstance(extra, str) and extra.strip():
             cmd.extend(shlex.split(extra.strip()))
         run_cwd = str(self.project_root) if self.resume else str(Path.cwd())
@@ -3416,12 +3663,13 @@ class AILauncher:
             run_cwd = str(resume_dir)
         return cmd, run_cwd, has_history
 
-    def _start_claude(self) -> int:
+    def _start_claude(self, provider: str = "claude") -> int:
+        _base, _inst, qualified = self._split_provider(provider)
         print(f"🚀 {t('starting_claude')}")
-        env = self._build_claude_env()
+        env = self._build_claude_env(qualified)
 
         try:
-            cmd, run_cwd, has_history = self._claude_start_plan()
+            cmd, run_cwd, has_history = self._claude_start_plan(qualified)
         except FileNotFoundError as e:
             print(str(e))
             return 1
@@ -3437,13 +3685,13 @@ class AILauncher:
         print(f"🔌 Active backends: {', '.join(self.providers)}")
         print()
         print("🎯 Available commands:")
-        if "codex" in self.providers:
+        if self._has_base_provider("codex"):
             print("   cask/cping/cpend - Codex communication")
-        if "gemini" in self.providers:
+        if self._has_base_provider("gemini"):
             print("   gask/gping/gpend - Gemini communication")
-        if "opencode" in self.providers:
+        if self._has_base_provider("opencode"):
             print("   oask/oping/opend - OpenCode communication")
-        if "droid" in self.providers:
+        if self._has_base_provider("droid"):
             print("   dask/dping/dpend - Droid communication")
         print()
         print(f"Executing: {' '.join(cmd)}")
@@ -3457,12 +3705,14 @@ class AILauncher:
             print(f"\n⚠️ {t('user_interrupted')}")
             return 130
 
-    def _start_claude_pane(self, *, parent_pane: str | None, direction: str | None) -> str | None:
+    def _start_claude_pane(self, *, parent_pane: str | None, direction: str | None, provider: str = "claude") -> str | None:
+        _base, _inst, qualified = self._split_provider(provider)
+        disp = display_provider_name(qualified)
         print(f"🚀 {t('starting_claude')}")
-        env_overrides = self._claude_env_overrides()
+        env_overrides = self._claude_env_overrides(qualified)
 
         try:
-            cmd_parts, run_cwd, has_history = self._claude_start_plan()
+            cmd_parts, run_cwd, has_history = self._claude_start_plan(qualified)
         except FileNotFoundError as e:
             print(str(e))
             return None
@@ -3473,9 +3723,10 @@ class AILauncher:
             else:
                 print(f"ℹ️ {t('no_claude_session')}")
 
+        pane_title_marker = self._pane_title_marker(qualified)
         start_cmd = " ".join(cmd_parts)
         full_cmd = (
-            _build_pane_title_cmd(f"CCB-Claude-{self.project_id[:8]}")
+            _build_pane_title_cmd(pane_title_marker)
             + self._build_env_prefix(env_overrides)
             + _build_export_path_cmd(self.script_dir / "bin")
             + start_cmd
@@ -3487,28 +3738,28 @@ class AILauncher:
         if self.terminal_type == "wezterm":
             backend = WeztermBackend()
             pane_id = backend.create_pane(full_cmd, run_cwd, direction=use_direction, percent=50, parent_pane=use_parent)
-            self.wezterm_panes["claude"] = pane_id
+            self.wezterm_panes[qualified] = pane_id
         else:
             backend = TmuxBackend()
             pane_id = backend.create_pane("", run_cwd, direction=use_direction, percent=50, parent_pane=use_parent)
             backend.respawn_pane(pane_id, cmd=full_cmd, cwd=run_cwd, remain_on_exit=True)
-            backend.set_pane_title(pane_id, f"CCB-Claude-{self.project_id[:8]}")
-            backend.set_pane_user_option(pane_id, "@ccb_agent", "Claude")
-            self.tmux_panes["claude"] = pane_id
+            pane_title_marker = self._apply_tmux_pane_identity(backend, pane_id, qualified)
+            self.tmux_panes[qualified] = pane_id
 
         try:
             self._write_local_claude_session(
-                session_id=self._read_local_claude_session_id(),
+                session_id=self._read_local_claude_session_id(qualified),
                 active=True,
                 pane_id=str(pane_id or ""),
-                pane_title_marker=f"CCB-Claude-{self.project_id[:8]}",
+                pane_title_marker=pane_title_marker,
                 terminal=self.terminal_type,
                 start_cmd=full_cmd,
+                provider=qualified,
             )
         except Exception:
             pass
 
-        print(f"✅ {t('started_backend', provider='Claude', terminal=f'{self.terminal_type} pane', pane_id=pane_id)}")
+        print(f"✅ {t('started_backend', provider=disp, terminal=f'{self.terminal_type} pane', pane_id=pane_id)}")
         return pane_id
 
     def cleanup(
@@ -3566,13 +3817,19 @@ class AILauncher:
                         backend.kill_pane(pane_id)
 
         if clear_sessions:
-            for session_file in [
+            session_files_to_clear: list[Path] = [
                 self._project_session_file(".codex-session"),
                 self._project_session_file(".gemini-session"),
                 self._project_session_file(".opencode-session"),
                 self._project_session_file(".claude-session"),
                 self._project_session_file(".droid-session"),
-            ]:
+                self._project_session_file(".grok-session"),
+            ]
+            for prov in self.providers:
+                sf = self._project_session_file(session_filename_for_provider(prov))
+                if sf not in session_files_to_clear:
+                    session_files_to_clear.append(sf)
+            for session_file in session_files_to_clear:
                 if session_file.exists():
                     try:
                         data = self._read_json_file(session_file)
@@ -3755,17 +4012,19 @@ class AILauncher:
             pass
 
         # Mark current Claude pane/session as active when Claude is the anchor.
-        if self.anchor_provider == "claude":
+        anchor_base, _anchor_inst, anchor_qualified = self._split_provider(self.anchor_provider)
+        if anchor_base == "claude":
             # Reconstruct the same start_cmd that _start_claude_pane would have
             # built — needed so `/respawn claude` from Telegram can re-run it.
             # Best-effort: any failure here is non-fatal (we just lose respawn
             # support for this pane, same as before this change).
+            anchor_marker = self._pane_title_marker(anchor_qualified)
             anchor_start_cmd: str | None = None
             try:
-                cmd_parts, _run_cwd, _has_history = self._claude_start_plan()
+                cmd_parts, _run_cwd, _has_history = self._claude_start_plan(anchor_qualified)
                 anchor_start_cmd = (
-                    _build_pane_title_cmd(f"CCB-Claude-{self.project_id[:8]}")
-                    + self._build_env_prefix(self._claude_env_overrides())
+                    _build_pane_title_cmd(anchor_marker)
+                    + self._build_env_prefix(self._claude_env_overrides(anchor_qualified))
                     + _build_export_path_cmd(self.script_dir / "bin")
                     + " ".join(cmd_parts)
                 )
@@ -3773,12 +4032,13 @@ class AILauncher:
                 anchor_start_cmd = None
             try:
                 self._write_local_claude_session(
-                    session_id=self._read_local_claude_session_id(),
+                    session_id=self._read_local_claude_session_id(anchor_qualified),
                     active=True,
                     pane_id=str(self.anchor_pane_id or ""),
-                    pane_title_marker=f"CCB-Claude-{self.project_id[:8]}",
+                    pane_title_marker=anchor_marker,
                     terminal=self.terminal_type,
                     start_cmd=anchor_start_cmd,
+                    provider=anchor_qualified,
                 )
             except Exception:
                 pass
@@ -3786,11 +4046,12 @@ class AILauncher:
         def _start_item(item: str, *, parent: str | None, direction: str | None) -> str | None:
             if item == "cmd":
                 return self._start_cmd_pane(parent_pane=parent, direction=direction, cmd_settings=cmd_settings)
-            if item == "claude":
-                return self._start_claude_pane(parent_pane=parent, direction=direction)
-            pane_id = self._start_provider(item, parent_pane=parent, direction=direction)
+            item_base, _item_inst, item_qualified = self._split_provider(item)
+            if item_base == "claude":
+                return self._start_claude_pane(parent_pane=parent, direction=direction, provider=item_qualified)
+            pane_id = self._start_provider(item_qualified, parent_pane=parent, direction=direction)
             if pane_id:
-                self._warmup_provider(item)
+                self._warmup_provider(item_qualified)
             return pane_id
 
         right_top: str | None = None
@@ -3814,7 +4075,7 @@ class AILauncher:
             last_right = pane_id
 
         # Optional: start caskd after Codex session file exists (first startup convenience).
-        if "codex" in self.providers and self.anchor_provider != "codex":
+        if self._has_base_provider("codex") and anchor_base != "codex":
             self._maybe_start_caskd()
 
         # Start watchdog thread to monitor daemon health (provider-agnostic)
@@ -4513,6 +4774,7 @@ def _parse_providers(values: list[str], *, allow_unknown: bool = False) -> list[
     Accept both:
       - space-separated: `ccb codex gemini opencode claude droid grok`
       - comma-separated: `ccb codex,gemini,opencode,claude,droid,grok`
+      - qualified/aliased: `ccb opencode:alpha opencode:beta claude` or `ccb alpha=opencode beta=opencode`
 
     Returns a de-duplicated list preserving order.
     """
@@ -4526,17 +4788,19 @@ def _parse_providers(values: list[str], *, allow_unknown: bool = False) -> list[
     parsed: list[str] = []
     unknown: list[str] = []
     for p in raw_parts:
-        if p in seen:
+        base, _inst, canonical = resolve_provider_key(p, allowed_bases=allowed)
+        if canonical in seen:
             continue
-        seen.add(p)
-        if p in allowed or allow_unknown:
-            parsed.append(p)
+        if base in allowed or allow_unknown:
+            seen.add(canonical)
+            parsed.append(canonical)
         else:
             unknown.append(p)
 
     if unknown and not allow_unknown:
         print(f"❌ invalid provider(s): {', '.join(unknown)}", file=sys.stderr)
         print("💡 use: ccb codex gemini opencode claude droid grok  (spaces)  or  ccb codex,gemini,opencode,claude,droid,grok  (commas)", file=sys.stderr)
+        print("💡 multi-instance alias: ccb opencode:alpha opencode:beta claude", file=sys.stderr)
         print("💡 allowed: codex, gemini, opencode, claude, droid, grok", file=sys.stderr)
         return []
 
@@ -4562,18 +4826,20 @@ def _parse_providers_with_cmd(values: list[str]) -> tuple[list[str], bool]:
         if p == "cmd":
             cmd_enabled = True
             continue
-        if p in seen:
+        base, _inst, canonical = resolve_provider_key(p, allowed_bases=allowed)
+        if canonical in seen:
             continue
-        seen.add(p)
-        if p in allowed:
-            parsed.append(p)
+        if base in allowed:
+            seen.add(canonical)
+            parsed.append(canonical)
         else:
             unknown.append(p)
 
     if unknown:
         print(f"❌ invalid provider(s): {', '.join(unknown)}", file=sys.stderr)
         print("💡 use: ccb codex gemini opencode claude droid cmd  (spaces)  or  ccb codex,gemini,opencode,claude,droid,cmd  (commas)", file=sys.stderr)
-        print("💡 allowed: codex, gemini, opencode, claude, droid, cmd", file=sys.stderr)
+        print("💡 multi-instance alias: ccb opencode:alpha opencode:beta claude", file=sys.stderr)
+        print("💡 allowed: codex, gemini, opencode, claude, droid, grok, cmd", file=sys.stderr)
         return [], cmd_enabled
 
     return parsed, cmd_enabled
@@ -5685,7 +5951,7 @@ def main():
         help="Backends to start (space or comma separated): codex, gemini, opencode, claude, droid (add cmd for a shell pane)",
     )
     start_parser.add_argument("-r", "--resume", "--restore", action="store_true", help="Resume context")
-    start_parser.add_argument("-a", "--auto", action="store_true", help="Full auto permission mode")
+    start_parser.add_argument("-a", "--auto", "--yolo", action="store_true", help="Full auto permission mode")
     start_parser.add_argument(
         "-R",
         "--replace-existing",

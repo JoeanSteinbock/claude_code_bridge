@@ -4,6 +4,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from ccb_start_config import load_start_config
+from providers import make_qualified_key, parse_qualified_provider
 from session_utils import project_config_dir
 
 CONFIG_FILE = "ccb.config"
@@ -62,8 +63,9 @@ class TelegramConfig:
 
 def _normalize_provider(value: str) -> str:
     provider = (value or "").strip().lower()
-    if provider in SUPPORTED_PROVIDERS:
-        return provider
+    base, inst = parse_qualified_provider(provider)
+    if base in SUPPORTED_PROVIDERS:
+        return make_qualified_key(base, inst)
     return "claude"
 
 
@@ -72,10 +74,12 @@ def _normalize_provider_list(values: list | tuple | set | None) -> list[str]:
     seen: set[str] = set()
     for raw in values or []:
         provider = (str(raw or "")).strip().lower()
-        if provider not in SUPPORTED_PROVIDERS or provider in seen:
+        base, inst = parse_qualified_provider(provider)
+        qual = make_qualified_key(base, inst)
+        if base not in SUPPORTED_PROVIDERS or qual in seen:
             continue
-        seen.add(provider)
-        out.append(provider)
+        seen.add(qual)
+        out.append(qual)
     return out
 
 

@@ -33,10 +33,11 @@ if _LIB.is_dir() and str(_LIB) not in sys.path:
 
 import wake_queue  # noqa: E402
 from ccb_protocol import make_req_id  # noqa: E402
+from providers import resolve_provider_key  # noqa: E402
 
 SUPPORTED_AGENTS = {
     "claude", "codex", "gemini", "opencode", "droid",
-    "copilot", "codebuddy", "qwen",
+    "copilot", "codebuddy", "qwen", "grok",
 }
 
 _DUR_RE = re.compile(r"(\d+)([smh])", re.IGNORECASE)
@@ -122,9 +123,13 @@ def _resolve_caller(explicit: str) -> str:
 
 
 def cmd_add(args: argparse.Namespace) -> int:
-    agent = args.agent.lower().strip()
-    if agent not in SUPPORTED_AGENTS:
-        print(f"wake: unknown agent {agent!r}. One of: {sorted(SUPPORTED_AGENTS)}", file=sys.stderr)
+    raw_agent = args.agent.lower().strip()
+    project_root = resolve_project_root()
+    base_agent, _inst, agent = resolve_provider_key(
+        raw_agent, project_root, allowed_bases=SUPPORTED_AGENTS
+    )
+    if base_agent not in SUPPORTED_AGENTS:
+        print(f"wake: unknown agent {raw_agent!r}. One of: {sorted(SUPPORTED_AGENTS)} (or <agent>:<alias>)", file=sys.stderr)
         return 2
 
     try:

@@ -6,6 +6,7 @@ from pathlib import Path
 import re
 from typing import Optional, Tuple
 
+from providers import normalize_provider_token, parse_qualified_provider
 from session_utils import legacy_project_config_dir, project_config_dir
 
 
@@ -39,7 +40,10 @@ def _parse_tokens(raw: str) -> list[str]:
     return [p for p in (part.strip() for part in parts) if p]
 
 
-def _normalize_providers(tokens: list[str]) -> tuple[list[str], bool]:
+def _normalize_providers(
+    tokens: list[str],
+    aliases: Optional[dict[str, str]] = None,
+) -> tuple[list[str], bool]:
     providers: list[str] = []
     seen: set[str] = set()
     cmd_enabled = False
@@ -50,12 +54,14 @@ def _normalize_providers(tokens: list[str]) -> tuple[list[str], bool]:
         if token == "cmd":
             cmd_enabled = True
             continue
-        if token not in _ALLOWED_PROVIDERS:
+        canonical = normalize_provider_token(token, aliases=aliases)
+        base, _instance = parse_qualified_provider(canonical)
+        if base not in _ALLOWED_PROVIDERS:
             continue
-        if token in seen:
+        if canonical in seen:
             continue
-        seen.add(token)
-        providers.append(token)
+        seen.add(canonical)
+        providers.append(canonical)
     return providers, cmd_enabled
 
 
@@ -63,6 +69,7 @@ def _parse_config_obj(obj: object) -> dict:
     if isinstance(obj, dict):
         data = dict(obj)
         raw_providers = data.get("providers")
+        raw_aliases = data.get("aliases") if isinstance(data.get("aliases"), dict) else None
         tokens: list[str] = []
         if isinstance(raw_providers, str):
             tokens = _parse_tokens(raw_providers)
@@ -72,7 +79,7 @@ def _parse_config_obj(obj: object) -> dict:
             tokens = [str(raw_providers)]
 
         if tokens:
-            providers, cmd_enabled = _normalize_providers(tokens)
+            providers, cmd_enabled = _normalize_providers(tokens, aliases=raw_aliases)
             data["providers"] = providers
             if cmd_enabled and "cmd" not in data:
                 data["cmd"] = True

@@ -41,6 +41,7 @@ from completion_hook import (
     default_reply_for_status,
     normalize_completion_status,
 )
+from providers import display_provider_name, session_filename_for_provider
 from session_utils import find_project_session_file
 
 setup_windows_encoding()
@@ -586,14 +587,7 @@ def main() -> int:
             return 1
 
     # Terminal caller - construct notification message
-    provider_names = {
-        "codex": "Codex",
-        "gemini": "Gemini",
-        "opencode": "OpenCode",
-        "droid": "Droid",
-        "grok": "Grok",
-    }
-    provider_display = provider_names.get(provider, provider.capitalize())
+    provider_display = display_provider_name(provider)
     req_id = args.req_id or "unknown"
 
     message = _render_terminal_message(
@@ -620,16 +614,8 @@ def main() -> int:
         terminal = direct_terminal or "tmux"
         _debug_log(f"routing direct pane={pane_id!r} terminal={terminal}")
     else:
-        # Fallback: find caller's pane_id from session file
-        session_files = {
-            "claude": ".claude-session",
-            "codex": ".codex-session",
-            "gemini": ".gemini-session",
-            "opencode": ".opencode-session",
-            "droid": ".droid-session",
-            "grok": ".grok-session",
-        }
-        session_filename = session_files.get(caller, ".claude-session")
+        # Fallback: find caller's pane_id from session file (supports instance-qualified callers)
+        session_filename = session_filename_for_provider(caller or "claude")
 
         work_dir = os.environ.get("CCB_WORK_DIR", "")
         search_paths: list[Path] = []

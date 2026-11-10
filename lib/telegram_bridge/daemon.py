@@ -18,6 +18,7 @@ from .bot_api import TelegramApiError, TelegramBotClient, chunk_message
 from .config import SUPPORTED_PROVIDERS, TelegramConfig, get_config_dir, get_project_root, is_configured, load_config
 from .router import help_text, parse_message
 from project_id import compute_ccb_project_id
+from providers import display_provider_name, parse_qualified_provider, resolve_provider_key, session_filename_for_provider
 from session_utils import find_project_session_file
 
 STATE_FILE = "telegramd.json"
@@ -37,7 +38,7 @@ SESSION_FILES = {
 
 # Matches the `[Provider]` prefix our bot prepends to every reply
 # (see _run_request). Used to infer routing when a user taps reply.
-_PROVIDER_PREFIX_RE = re.compile(r"^\[([A-Za-z][A-Za-z0-9_-]*)\]")
+_PROVIDER_PREFIX_RE = re.compile(r"^\[([A-Za-z][A-Za-z0-9_:-]*)\]")
 
 # Grok writes image_gen / image_edit / video_gen outputs under
 # ~/.grok/sessions/<encoded-cwd>/<session>/{images,videos}/N.{ext}
@@ -367,7 +368,8 @@ def _match_provider_prefix(body: str) -> str | None:
     if not m:
         return None
     candidate = m.group(1).lower()
-    return candidate if candidate in SUPPORTED_PROVIDERS else None
+    base, _inst = parse_qualified_provider(candidate)
+    return candidate if base in SUPPORTED_PROVIDERS else None
 
 
 def _provider_from_replied_to(msg: dict | None) -> str | None:
@@ -1717,6 +1719,35 @@ class TelegramDaemon:
             if data.get("active") is False:
                 continue
             mounted.append(provider)
+
+        # Also include instance-qualified sessions (.ccb/.<base>-<instance>-session)
+        for cfg_dir in (work_dir / ".ccb", work_dir / ".ccb_config"):
+            if not cfg_dir.is_dir():
+                continue
+            try:
+                candidates = sorted(cfg_dir.glob(".*-session"))
+            except Exception:
+                candidates = []
+            for sf in candidates:
+                name = sf.name  # e.g. '.opencode-alpha-session'
+                if not (name.startswith(".") and name.endswith("-session")):
+                    continue
+                stem = name[1 : -len("-session")]  # e.g. 'opencode-alpha'
+                if "-" not in stem:
+                    continue
+                base, inst = stem.split("-", 1)
+                if base not in SUPPORTED_PROVIDERS or not inst:
+                    continue
+                qual = f"{base}:{inst}"
+                if qual in mounted:
+                    continue
+                try:
+                    data = json.loads(sf.read_text(encoding="utf-8-sig"))
+                except Exception:
+                    continue
+                if not isinstance(data, dict) or data.get("active") is False:
+                    continue
+                mounted.append(qual)
         return mounted
 
     def _find_ask_command(self) -> str | None:
@@ -1762,13 +1793,16 @@ class TelegramDaemon:
                                 reply_to_message_id=reply_to_message_id)
                 return
         else:
-            target = (parsed.provider or "").strip().lower()
-            if not target or target not in SUPPORTED_PROVIDERS:
-                rest = (parsed.message or "").strip() or "(empty)"
+            raw_target = (parsed.provider or parsed.message or "").strip().lower()
+            t_base, _t_inst, target = resolve_provider_key(
+                raw_target, self.project_root, allowed_bases=set(SUPPORTED_PROVIDERS)
+            )
+            if not target or t_base not in SUPPORTED_PROVIDERS:
+                rest = (parsed.message or parsed.provider or "").strip() or "(empty)"
                 self._send_text(
                     chat_id,
                     f"Unknown provider for /new: {rest!r}. Try one of: "
-                    f"{', '.join(SUPPORTED_PROVIDERS)} or 'all'.",
+                    f"{', '.join(SUPPORTED_PROVIDERS)} (or <provider>:<alias>) or 'all'.",
                     reply_to_message_id=reply_to_message_id,
                 )
                 return
@@ -1820,13 +1854,16 @@ class TelegramDaemon:
                                 reply_to_message_id=reply_to_message_id)
                 return
         else:
-            target = (parsed.provider or "").strip().lower()
-            if not target or target not in SUPPORTED_PROVIDERS:
-                rest = (parsed.message or "").strip() or "(empty)"
+            raw_target = (parsed.provider or parsed.message or "").strip().lower()
+            t_base, _t_inst, target = resolve_provider_key(
+                raw_target, self.project_root, allowed_bases=set(SUPPORTED_PROVIDERS)
+            )
+            if not target or t_base not in SUPPORTED_PROVIDERS:
+                rest = (parsed.message or parsed.provider or "").strip() or "(empty)"
                 self._send_text(
                     chat_id,
                     f"Unknown provider for /respawn: {rest!r}. Try one of: "
-                    f"{', '.join(SUPPORTED_PROVIDERS)} or 'all'.",
+                    f"{', '.join(SUPPORTED_PROVIDERS)} (or <provider>:<alias>) or 'all'.",
                     reply_to_message_id=reply_to_message_id,
                 )
                 return
@@ -1843,7 +1880,7 @@ class TelegramDaemon:
 
         results: list[str] = []
         for target in targets:
-            session_name = SESSION_FILES.get(target)
+            session_name = session_filename_for_provider(target)
             if not session_name:
                 results.append(f"✗ {target}: no session file mapping")
                 continue
@@ -2228,7 +2265,10 @@ class TelegramDaemon:
         (capture-pane is tmux-only).
         """
         try:
-            session_filename = SESSION_FILES.get(provider)
+            _base, _inst, qual = resolve_provider_key(
+                provider, self.project_root, allowed_bases=set(SUPPORTED_PROVIDERS)
+            )
+            session_filename = session_filename_for_provider(qual)
             if not session_filename:
                 return ""
             session_file = find_project_session_file(self.project_root, session_filename)
@@ -2253,12 +2293,15 @@ class TelegramDaemon:
         Read-only — doesn't type anything into the pane. Useful for
         checking on a long-running turn remotely without interrupting it.
         """
-        provider = (provider or "claude").strip().lower()
-        if provider not in SUPPORTED_PROVIDERS:
-            self._send_text(chat_id, f"Unknown provider: {provider}",
+        raw_provider = (provider or "claude").strip().lower()
+        base_prov, _inst, provider = resolve_provider_key(
+            raw_provider, self.project_root, allowed_bases=set(SUPPORTED_PROVIDERS)
+        )
+        if base_prov not in SUPPORTED_PROVIDERS:
+            self._send_text(chat_id, f"Unknown provider: {raw_provider}",
                             reply_to_message_id=reply_to_message_id)
             return
-        session_filename = SESSION_FILES.get(provider)
+        session_filename = session_filename_for_provider(provider)
         if not session_filename:
             self._send_text(chat_id, f"No session-file mapping for provider {provider}.",
                             reply_to_message_id=reply_to_message_id)
@@ -2341,13 +2384,16 @@ class TelegramDaemon:
         provider's CLI. We snapshot the pane before sending, wait a few
         seconds, capture the post-send tail, and post the diff.
         """
-        provider = (provider or "claude").strip().lower()
-        if provider not in SUPPORTED_PROVIDERS:
-            self._send_text(chat_id, f"Unknown provider: {provider}",
+        raw_provider = (provider or "claude").strip().lower()
+        base_prov, _inst, provider = resolve_provider_key(
+            raw_provider, self.project_root, allowed_bases=set(SUPPORTED_PROVIDERS)
+        )
+        if base_prov not in SUPPORTED_PROVIDERS:
+            self._send_text(chat_id, f"Unknown provider: {raw_provider}",
                             reply_to_message_id=reply_to_message_id)
             return
 
-        session_filename = SESSION_FILES.get(provider)
+        session_filename = session_filename_for_provider(provider)
         if not session_filename:
             self._send_text(chat_id, f"No session-file mapping for provider {provider}.",
                             reply_to_message_id=reply_to_message_id)

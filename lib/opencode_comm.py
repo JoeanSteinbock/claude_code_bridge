@@ -426,6 +426,7 @@ class OpenCodeLogReader:
         allow_git_root_fallback = _env_truthy("OPENCODE_ALLOW_GIT_ROOT_FALLBACK")
         self.project_id = (env_project_id or project_id or "global").strip() or "global"
         self._session_id_filter = (session_id_filter or "").strip() or None
+        self._pin_session_filter = False
         if not explicit_project_id:
             detected = self._detect_project_id_for_workdir()
             if detected:
@@ -721,8 +722,13 @@ class OpenCodeLogReader:
                 best_updated = updated
 
         # If we have a filter but found a newer unfiltered session, use it instead
-        # This allows detecting new sessions created after the filter was set
-        if self._session_id_filter and latest_unfiltered and latest_unfiltered_updated > best_updated:
+        # (unless the filter is pinned to a specific req_id's session).
+        if (
+            self._session_id_filter
+            and not self._pin_session_filter
+            and latest_unfiltered
+            and latest_unfiltered_updated > best_updated
+        ):
             return latest_unfiltered
 
         return best_match
@@ -810,10 +816,10 @@ class OpenCodeLogReader:
                 best_updated = updated
                 best_mtime = mtime
 
-        # If we have a filtered match, use it only if there's no newer work_dir match.
-        # This handles the case where OpenCode was restarted and created a new session.
+        # If we have a filtered match, use it only if there's no newer work_dir match
+        # (unless the filter is pinned to a specific req_id's session).
         if filtered_match:
-            if best_match and best_updated > filtered_updated:
+            if not self._pin_session_filter and best_match and best_updated > filtered_updated:
                 # A newer session exists for the same work_dir; prefer it over stale binding.
                 return best_match
             return filtered_match
@@ -1017,8 +1023,53 @@ class OpenCodeLogReader:
             "last_assistant_has_done": last_has_done,
         }
 
+    def find_session_id_for_req_id(self, req_id: str) -> Optional[str]:
+        """Locate the OpenCode session_id whose message parts contain `req_id`."""
+        target = (req_id or "").strip()
+        if not target:
+            return None
+
+        # 1. Fast path: SQLite part table search
+        rows = self._fetch_opencode_db_rows(
+            "SELECT session_id FROM part WHERE data LIKE ? ORDER BY time_created DESC LIMIT 5",
+            (f"%{target}%",),
+        )
+        for row in rows:
+            sid = row["session_id"]
+            if isinstance(sid, str) and sid.strip():
+                return sid.strip()
+
+        # 2. Fallback: file-based storage search across candidate sessions for work_dir
+        sessions_dir = self._session_dir()
+        if not sessions_dir.exists():
+            return None
+        try:
+            session_files = sorted(
+                (p for p in sessions_dir.glob("ses_*.json") if p.is_file()),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+        except Exception:
+            session_files = []
+
+        for sf in session_files[:20]:
+            payload = self._load_json(sf)
+            sid = payload.get("id")
+            if not isinstance(sid, str) or not sid:
+                continue
+            messages = self._read_messages_from_files(sid)
+            for msg in reversed(messages[-10:]):
+                mid = msg.get("id")
+                if not isinstance(mid, str) or not mid:
+                    continue
+                for part in self._read_parts_from_files(mid):
+                    txt = part.get("text")
+                    if isinstance(txt, str) and target in txt:
+                        return sid
+        return None
+
     def _find_new_assistant_reply_with_state(
-        self, session_id: str, state: Dict[str, Any]
+        self, session_id: str, state: Dict[str, Any], *, req_id: Optional[str] = None
     ) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
         prev_count = int(state.get("assistant_count") or 0)
         prev_last = state.get("last_assistant_id")
@@ -1026,11 +1077,43 @@ class OpenCodeLogReader:
         prev_has_done = bool(state.get("last_assistant_has_done"))
 
         messages = self._read_messages(session_id)
-        assistants = [m for m in messages if m.get("role") == "assistant" and isinstance(m.get("id"), str)]
-        if not assistants:
-            return None, None
+        if req_id:
+            target_req = req_id.strip()
+            req_user_idx = -1
+            req_user_id: str | None = None
+            for idx, m in enumerate(messages):
+                if m.get("role") != "user":
+                    continue
+                mid = m.get("id")
+                if not isinstance(mid, str) or not mid:
+                    continue
+                u_parts = self._read_parts(mid)
+                u_text = self._extract_text(u_parts, allow_reasoning_fallback=True)
+                if target_req in u_text:
+                    req_user_idx = idx
+                    req_user_id = mid
+            if req_user_idx >= 0:
+                after_msgs = [
+                    m for m in messages[req_user_idx + 1 :]
+                    if m.get("role") == "assistant"
+                    and isinstance(m.get("id"), str)
+                    and (not req_user_id or not m.get("parentID") or m.get("parentID") == req_user_id)
+                ]
+                if not after_msgs:
+                    return None, None
+                assistants = [m for m in messages if m.get("role") == "assistant" and isinstance(m.get("id"), str)]
+                latest = after_msgs[-1]
+            else:
+                assistants = [m for m in messages if m.get("role") == "assistant" and isinstance(m.get("id"), str)]
+                if not assistants:
+                    return None, None
+                latest = assistants[-1]
+        else:
+            assistants = [m for m in messages if m.get("role") == "assistant" and isinstance(m.get("id"), str)]
+            if not assistants:
+                return None, None
+            latest = assistants[-1]
 
-        latest = assistants[-1]
         latest_id = latest.get("id")
         completed = (latest.get("time") or {}).get("completed")
         try:
@@ -1083,7 +1166,14 @@ class OpenCodeLogReader:
         reply, _reply_state = self._find_new_assistant_reply_with_state(session_id, state)
         return reply
 
-    def _read_since(self, state: Dict[str, Any], timeout: float, block: bool) -> Tuple[Optional[str], Dict[str, Any]]:
+    def _read_since(
+        self,
+        state: Dict[str, Any],
+        timeout: float,
+        block: bool,
+        *,
+        req_id: Optional[str] = None,
+    ) -> Tuple[Optional[str], Dict[str, Any]]:
         deadline = time.time() + timeout
         last_forced_read = time.time()
 
@@ -1092,6 +1182,21 @@ class OpenCodeLogReader:
             session_id = None
 
         while True:
+            if req_id and not self._pin_session_filter:
+                matched_sid = self.find_session_id_for_req_id(req_id)
+                if matched_sid:
+                    self._session_id_filter = matched_sid
+                    self._pin_session_filter = True
+                    if session_id != matched_sid:
+                        session_id = matched_sid
+                        state = dict(state)
+                        state["session_id"] = matched_sid
+                        state["session_updated"] = -1
+                        state["assistant_count"] = 0
+                        state["last_assistant_id"] = None
+                        state["last_assistant_completed"] = None
+                        state["last_assistant_has_done"] = False
+
             session_entry = self._get_latest_session()
             if not session_entry:
                 if not block:
@@ -1138,7 +1243,9 @@ class OpenCodeLogReader:
                 last_forced_read = time.time()
 
             if should_scan:
-                reply, reply_state = self._find_new_assistant_reply_with_state(current_session_id, state)
+                reply, reply_state = self._find_new_assistant_reply_with_state(
+                    current_session_id, state, req_id=req_id
+                )
                 if reply:
                     # Build next cursor from the exact reply snapshot to avoid racing
                     # against newer assistant messages created immediately afterwards.
@@ -1187,11 +1294,15 @@ class OpenCodeLogReader:
             if time.time() >= deadline:
                 return None, state
 
-    def wait_for_message(self, state: Dict[str, Any], timeout: float) -> Tuple[Optional[str], Dict[str, Any]]:
-        return self._read_since(state, timeout, block=True)
+    def wait_for_message(
+        self, state: Dict[str, Any], timeout: float, *, req_id: Optional[str] = None
+    ) -> Tuple[Optional[str], Dict[str, Any]]:
+        return self._read_since(state, timeout, block=True, req_id=req_id)
 
-    def try_get_message(self, state: Dict[str, Any]) -> Tuple[Optional[str], Dict[str, Any]]:
-        return self._read_since(state, timeout=0.0, block=False)
+    def try_get_message(
+        self, state: Dict[str, Any], *, req_id: Optional[str] = None
+    ) -> Tuple[Optional[str], Dict[str, Any]]:
+        return self._read_since(state, timeout=0.0, block=False, req_id=req_id)
 
     def latest_message(self) -> Optional[str]:
         session_entry = self._get_latest_session()

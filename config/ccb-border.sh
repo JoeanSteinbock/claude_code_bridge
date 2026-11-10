@@ -28,22 +28,22 @@ set_border() {
 }
 
 case "$key" in
-    Codex)
+    Codex|Codex:*)
         set_border "fg=#ff9e64,bold" # Orange
         ;;
-    Gemini)
+    Gemini|Gemini:*)
         set_border "fg=#7dcfff,bold" # Cyan
         ;;
-    Claude)
+    Claude|Claude:*)
         set_border "fg=#bb9af7,bold" # Purple
         ;;
-    OpenCode)
+    OpenCode|OpenCode:*)
         set_border "fg=#9ece6a,bold" # Green
         ;;
-    Droid)
+    Droid|Droid:*)
         set_border "fg=#e0af68,bold" # Yellow
         ;;
-    Cmd)
+    Cmd|Cmd:*)
         set_border "fg=#7dcfff,bold" # Teal
         ;;
     *)

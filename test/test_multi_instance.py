@@ -340,3 +340,210 @@ class TestDaemonInstanceRouting:
         key1 = make_qualified_key("codex", "auth")
         key2 = make_qualified_key("gemini", "auth")
         assert key1 != key2
+
+
+# ── Alias resolution, ccb_start_config, launcher & OpenCode req_id isolation ─
+
+class TestProviderAliasAndLauncher:
+    def test_assignment_syntax_and_aliases(self):
+        from providers import normalize_provider_token, parse_qualified_provider, display_provider_name
+        assert parse_qualified_provider("oc1=opencode") == ("opencode", "oc1")
+        assert normalize_provider_token("oc1=opencode") == "opencode:oc1"
+        assert normalize_provider_token("agy:fast") == "gemini:fast"
+        assert normalize_provider_token("oc1", aliases={"oc1": "opencode", "oc2": "opencode"}) == "opencode:oc1"
+        assert display_provider_name("opencode:oc1") == "OpenCode:oc1"
+        assert display_provider_name("opencode") == "OpenCode"
+
+    def test_resolve_bare_alias_from_session_file_and_config(self, tmp_path):
+        from providers import resolve_provider_key
+        ccb_dir = tmp_path / ".ccb"
+        ccb_dir.mkdir()
+        (ccb_dir / ".opencode-alpha-session").write_text('{"active": true}', encoding="utf-8")
+
+        base, inst, qual = resolve_provider_key("alpha", work_dir=tmp_path)
+        assert (base, inst, qual) == ("opencode", "alpha", "opencode:alpha")
+
+        # Also resolve from ccb.config aliases map when session file doesn't exist yet
+        (ccb_dir / "ccb.config").write_text(
+            json.dumps({
+                "providers": ["opencode:alpha", "beta", "claude"],
+                "aliases": {"beta": "opencode"},
+            }),
+            encoding="utf-8",
+        )
+        assert resolve_provider_key("beta", work_dir=tmp_path) == ("opencode", "beta", "opencode:beta")
+
+    def test_start_config_multi_instance_and_aliases(self):
+        from ccb_start_config import _normalize_providers, _parse_config_obj
+        provs, cmd = _normalize_providers(["opencode:alpha", "opencode:beta", "claude"])
+        assert provs == ["opencode:alpha", "opencode:beta", "claude"]
+        assert cmd is False
+
+        provs2, _ = _normalize_providers(["oc1=opencode", "oc2=opencode", "claude"])
+        assert provs2 == ["opencode:oc1", "opencode:oc2", "claude"]
+
+        parsed = _parse_config_obj({
+            "providers": ["oc1", "oc2", "claude"],
+            "aliases": {"oc1": "opencode", "oc2": "opencode"},
+        })
+        assert parsed["providers"] == ["opencode:oc1", "opencode:oc2", "claude"]
+
+    def test_ccb_launcher_two_opencode_instances(self, tmp_path, monkeypatch):
+        import importlib.machinery
+        import importlib.util
+
+        ccb_path = Path(__file__).resolve().parent.parent / "ccb"
+        loader = importlib.machinery.SourceFileLoader("ccb_main_multi", str(ccb_path))
+        spec = importlib.util.spec_from_loader("ccb_main_multi", loader)
+        ccb = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(ccb)
+
+        assert ccb._parse_providers(["opencode:alpha", "opencode:beta", "claude"]) == [
+            "opencode:alpha",
+            "opencode:beta",
+            "claude",
+        ]
+        assert ccb._parse_providers(["alpha=opencode", "beta=opencode"]) == [
+            "opencode:alpha",
+            "opencode:beta",
+        ]
+
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".ccb").mkdir(exist_ok=True)
+        launcher = ccb.AILauncher(
+            providers=["opencode:alpha", "opencode:beta", "claude"],
+            resume=True,
+            auto=False,
+            launch_args={"opencode:alpha": "-m model-a", "opencode:beta": "-m model-b"},
+            launch_env={"opencode:alpha": {"CUSTOM_VAR": "alpha_val"}},
+        )
+        try:
+            # Separate runtime dirs
+            rt_a = launcher._runtime_subdir("opencode:alpha")
+            rt_b = launcher._runtime_subdir("opencode:beta")
+            assert rt_a != rt_b
+            assert rt_a.name == "opencode-alpha"
+            assert rt_b.name == "opencode-beta"
+
+            # Separate pane titles & agent labels
+            assert "CCB-OpenCode-alpha-" in launcher._pane_title_marker("opencode:alpha")
+            assert "CCB-OpenCode-beta-" in launcher._pane_title_marker("opencode:beta")
+            assert launcher._agent_labels("opencode:alpha") == ("OpenCode:alpha", "OpenCode")
+            assert launcher._agent_labels("opencode:beta") == ("OpenCode:beta", "OpenCode")
+
+            # Caller & per-instance launch_env
+            env_a = launcher._provider_env_overrides("opencode:alpha")
+            env_b = launcher._provider_env_overrides("opencode:beta")
+            assert env_a["CCB_CALLER"] == "opencode:alpha"
+            assert env_a["CUSTOM_VAR"] == "alpha_val"
+            assert env_b["CCB_CALLER"] == "opencode:beta"
+            assert "CUSTOM_VAR" not in env_b
+
+            # Separate session files written to .ccb/
+            monkeypatch.setattr(launcher, "_maybe_start_provider_daemon", lambda *a, **kw: None)
+            assert launcher._write_opencode_session(
+                rt_a, None, pane_id="%11", pane_title_marker="m1", start_cmd="opencode", provider="opencode:alpha"
+            )
+            assert launcher._write_opencode_session(
+                rt_b, None, pane_id="%12", pane_title_marker="m2", start_cmd="opencode", provider="opencode:beta"
+            )
+            sf_a = tmp_path / ".ccb" / ".opencode-alpha-session"
+            sf_b = tmp_path / ".ccb" / ".opencode-beta-session"
+            assert sf_a.is_file()
+            assert sf_b.is_file()
+            data_a = json.loads(sf_a.read_text(encoding="utf-8"))
+            data_b = json.loads(sf_b.read_text(encoding="utf-8"))
+            assert data_a["pane_id"] == "%11"
+            assert data_a["instance"] == "alpha"
+            assert data_b["pane_id"] == "%12"
+            assert data_b["instance"] == "beta"
+
+            # Per-instance resume with saved opencode_session_id + per-instance launch_args
+            data_a["opencode_session_id"] = "ses_alpha_111"
+            sf_a.write_text(json.dumps(data_a), encoding="utf-8")
+            cmd_a = launcher._get_start_cmd("opencode:alpha")
+            cmd_b = launcher._get_start_cmd("opencode:beta")
+            assert "--session ses_alpha_111" in cmd_a
+            assert "-m model-a" in cmd_a
+            assert "-m model-b" in cmd_b
+        finally:
+            launcher.cleanup(kill_panes=False, clear_sessions=True, remove_runtime=True, quiet=True)
+
+    def test_opencode_multi_instance_req_id_isolation_sqlite(self, tmp_path):
+        import sqlite3
+        from opencode_comm import OpenCodeLogReader
+
+        work_dir = tmp_path / "proj"
+        work_dir.mkdir()
+        root = tmp_path / "storage"
+        root.mkdir()
+        db_path = tmp_path / "opencode.db"
+
+        with sqlite3.connect(db_path) as conn:
+            conn.executescript(
+                """
+                CREATE TABLE session (
+                    id TEXT PRIMARY KEY,
+                    directory TEXT NOT NULL,
+                    time_updated INTEGER NOT NULL
+                );
+                CREATE TABLE message (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    time_created INTEGER NOT NULL,
+                    time_updated INTEGER NOT NULL,
+                    data TEXT NOT NULL
+                );
+                CREATE TABLE part (
+                    id TEXT PRIMARY KEY,
+                    message_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    time_created INTEGER NOT NULL,
+                    time_updated INTEGER NOT NULL,
+                    data TEXT NOT NULL
+                );
+                """
+            )
+            # Two OpenCode sessions in the same directory; ses_beta is newer!
+            conn.execute("INSERT INTO session VALUES (?, ?, ?)", ("ses_alpha", str(work_dir), 1000))
+            conn.execute("INSERT INTO session VALUES (?, ?, ?)", ("ses_beta", str(work_dir), 2000))
+
+            # User prompt + assistant reply in ses_alpha for req-alpha-1
+            conn.execute(
+                "INSERT INTO message VALUES (?, ?, ?, ?, ?)",
+                ("msg_u_a", "ses_alpha", 100, 100, json.dumps({"role": "user"})),
+            )
+            conn.execute(
+                "INSERT INTO part VALUES (?, ?, ?, ?, ?, ?)",
+                ("prt_u_a", "msg_u_a", "ses_alpha", 100, 100, json.dumps({"type": "text", "text": "CCB_REQ_ID: req-alpha-1\nhello alpha"})),
+            )
+            conn.execute(
+                "INSERT INTO message VALUES (?, ?, ?, ?, ?)",
+                ("msg_a_a", "ses_alpha", 110, 120, json.dumps({"role": "assistant", "parentID": "msg_u_a", "time": {"created": 110, "completed": 120}})),
+            )
+            conn.execute(
+                "INSERT INTO part VALUES (?, ?, ?, ?, ?, ?)",
+                ("prt_a_a", "msg_a_a", "ses_alpha", 115, 120, json.dumps({"type": "text", "text": "reply from alpha\nCCB_DONE: req-alpha-1"})),
+            )
+
+            # Unrelated newer activity in ses_beta
+            conn.execute(
+                "INSERT INTO message VALUES (?, ?, ?, ?, ?)",
+                ("msg_a_b", "ses_beta", 200, 210, json.dumps({"role": "assistant", "time": {"created": 200, "completed": 210}})),
+            )
+            conn.execute(
+                "INSERT INTO part VALUES (?, ?, ?, ?, ?, ?)",
+                ("prt_a_b", "msg_a_b", "ses_beta", 205, 210, json.dumps({"type": "text", "text": "reply from beta\nCCB_DONE: req-beta-9"})),
+            )
+            conn.commit()
+
+        reader = OpenCodeLogReader(root=root, work_dir=work_dir)
+        # Even if initial capture_state saw ses_beta (because ses_beta had higher time_updated),
+        # wait_for_message with req_id='req-alpha-1' pins to ses_alpha and returns alpha's reply!
+        state = reader.capture_state()
+        assert state["session_id"] == "ses_beta"
+
+        reply, new_state = reader.wait_for_message(state, 0.2, req_id="req-alpha-1")
+        assert reply is not None
+        assert "reply from alpha" in reply
+        assert new_state["session_id"] == "ses_alpha"

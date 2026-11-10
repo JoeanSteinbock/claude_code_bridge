@@ -30,15 +30,6 @@ import tempfile
 from datetime import datetime
 from pathlib import Path
 
-PROVIDER_DISPLAY = {
-    "opencode": "OpenCode",
-    "grok": "Grok",
-}
-
-
-def display_name(provider: str) -> str:
-    return PROVIDER_DISPLAY.get(provider, provider.capitalize())
-
 script_dir = Path(__file__).resolve().parent
 lib_dir = script_dir.parent / "lib"
 sys.path.insert(0, str(lib_dir))
@@ -47,8 +38,17 @@ from compat import read_stdin_text, setup_windows_encoding
 setup_windows_encoding()
 
 from cli_output import EXIT_ERROR, EXIT_OK
-from providers import parse_qualified_provider
+from providers import display_provider_name, parse_qualified_provider, resolve_provider_key
 from session_utils import find_project_session_file
+
+PROVIDER_DISPLAY = {
+    "opencode": "OpenCode",
+    "grok": "Grok",
+}
+
+
+def display_name(provider: str) -> str:
+    return display_provider_name(provider)
 
 
 # Provider to daemon command mapping
@@ -160,6 +160,9 @@ def _cleanup_task_logs(log_dir: Path) -> None:
 def _normalize_caller(raw: str) -> str:
     caller = (raw or "").strip().lower()
     if caller in VALID_CALLERS:
+        return caller
+    base, _inst = parse_qualified_provider(caller)
+    if base in VALID_CALLERS:
         return caller
     return ""
 
@@ -496,7 +499,8 @@ def _default_foreground() -> bool:
     # Default async only for Claude caller to preserve historical guardrail behavior.
     # Other callers (codex/gemini/opencode/droid/manual) default to foreground.
     caller = _detect_caller()
-    if caller == "claude":
+    base_caller, _ = parse_qualified_provider(caller)
+    if base_caller == "claude":
         return False
     return True
 
@@ -511,7 +515,8 @@ def _should_emit_async_guardrail(caller: str) -> bool:
     raw = (os.environ.get("CCB_ASK_EMIT_GUARDRAIL") or "").strip().lower()
     if raw:
         return raw not in ("0", "false", "no", "off")
-    return (caller or "").strip().lower() == "claude"
+    base_caller, _ = parse_qualified_provider((caller or "").strip().lower())
+    return base_caller == "claude"
 
 
 def _require_caller() -> str:
@@ -563,15 +568,17 @@ def main(argv: list[str]) -> int:
         _usage()
         return EXIT_OK
 
-    base_provider, instance = parse_qualified_provider(raw_provider)
+    base_provider, instance, qualified_provider = resolve_provider_key(
+        raw_provider, allowed_bases=set(PROVIDER_DAEMONS.keys())
+    )
 
     if base_provider not in PROVIDER_DAEMONS:
-        print(f"[ERROR] Unknown provider: {base_provider}", file=sys.stderr)
-        print(f"[ERROR] Available: {', '.join(PROVIDER_DAEMONS.keys())}", file=sys.stderr)
+        print(f"[ERROR] Unknown provider: {raw_provider}", file=sys.stderr)
+        print(f"[ERROR] Available: {', '.join(PROVIDER_DAEMONS.keys())} (or <provider>:<alias>)", file=sys.stderr)
         return EXIT_ERROR
 
     daemon_cmd = PROVIDER_DAEMONS[base_provider]
-    provider = raw_provider  # keep full qualified key for daemon routing
+    provider = qualified_provider  # keep full qualified key for daemon routing
 
     # Parse remaining arguments
     timeout: float = 3600.0

@@ -26,7 +26,7 @@ from oaskd_session import load_project_session
 from opencode_comm import OpenCodeLogReader
 from process_lock import ProviderLock
 from project_id import compute_ccb_project_id
-from providers import OASKD_SPEC
+from providers import OASKD_SPEC, make_qualified_key
 from terminal import get_backend_for_session
 
 
@@ -145,14 +145,17 @@ class OpenCodeAdapter(BaseProviderAdapter):
             project_id="global",
             session_id_filter=session.opencode_session_id_filter,
         )
+        if session.opencode_session_id_filter and req.instance:
+            log_reader._pin_session_filter = True
         state = log_reader.capture_state()
-        try:
-            session.update_opencode_binding(
-                session_id=state.get("session_id"),
-                project_id=str(getattr(log_reader, "project_id", "") or ""),
-            )
-        except Exception:
-            pass
+        if not req.instance or session.opencode_session_id_filter:
+            try:
+                session.update_opencode_binding(
+                    session_id=state.get("session_id"),
+                    project_id=str(getattr(log_reader, "project_id", "") or ""),
+                )
+            except Exception:
+                pass
 
         prompt = wrap_opencode_prompt(req.message, task.req_id, caller=req.caller)
         backend.send_text(pane_id, prompt)
@@ -208,7 +211,18 @@ class OpenCodeAdapter(BaseProviderAdapter):
                     )
                 last_pane_check = time.time()
 
-            reply, state = log_reader.wait_for_message(state, wait_step)
+            try:
+                reply, state = log_reader.wait_for_message(state, wait_step, req_id=task.req_id)
+            except TypeError:
+                reply, state = log_reader.wait_for_message(state, wait_step)
+            if state.get("session_id"):
+                try:
+                    session.update_opencode_binding(
+                        session_id=state.get("session_id"),
+                        project_id=str(getattr(log_reader, "project_id", "") or ""),
+                    )
+                except Exception:
+                    pass
             if not reply:
                 continue
             chunks.append(reply)
@@ -227,7 +241,7 @@ class OpenCodeAdapter(BaseProviderAdapter):
         if not reply_for_hook.strip():
             reply_for_hook = default_reply_for_status(status, done_seen=done_seen)
         notify_completion(
-            provider="opencode",
+            provider=make_qualified_key("opencode", req.instance),
             output_file=req.output_path,
             reply=reply_for_hook,
             req_id=task.req_id,

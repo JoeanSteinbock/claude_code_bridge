@@ -212,13 +212,13 @@ fi
 tmux set-window-option -t "$session" pane-border-style "$border_inactive" >/dev/null 2>&1 || true
 tmux set-window-option -t "$session" pane-active-border-style "$border_active" >/dev/null 2>&1 || true
 
-# Agent-specific pane title colors (consistent across themes)
-pane_format='#{?#{==:#{@ccb_agent},Claude},#[fg='${bg_main}']#[bg='${color_red}']#[bold] #P Claude #[default],'
-pane_format+='#{?#{==:#{@ccb_agent},Codex},#[fg='${bg_main}']#[bg='${color_orange}']#[bold] #P Codex #[default],'
-pane_format+='#{?#{==:#{@ccb_agent},Gemini},#[fg='${bg_main}']#[bg='${color_green}']#[bold] #P Gemini #[default],'
-pane_format+='#{?#{==:#{@ccb_agent},OpenCode},#[fg='${bg_main}']#[bg='${color_purple}']#[bold] #P OpenCode #[default],'
-pane_format+='#{?#{==:#{@ccb_agent},Droid},#[fg='${bg_main}']#[bg='${color_yellow}']#[bold] #P Droid #[default],'
-pane_format+='#{?#{==:#{@ccb_agent},Cmd},#[fg='${bg_main}']#[bg='${color_teal}']#[bold] #P Cmd #[default],'
+# Agent-specific pane title colors (consistent across themes; supports aliased panes via @ccb_agent_base)
+pane_format='#{?#{||:#{==:#{@ccb_agent_base},Claude},#{==:#{@ccb_agent},Claude}},#[fg='${bg_main}']#[bg='${color_red}']#[bold] #P #{@ccb_agent} #[default],'
+pane_format+='#{?#{||:#{==:#{@ccb_agent_base},Codex},#{==:#{@ccb_agent},Codex}},#[fg='${bg_main}']#[bg='${color_orange}']#[bold] #P #{@ccb_agent} #[default],'
+pane_format+='#{?#{||:#{==:#{@ccb_agent_base},Gemini},#{==:#{@ccb_agent},Gemini}},#[fg='${bg_main}']#[bg='${color_green}']#[bold] #P #{@ccb_agent} #[default],'
+pane_format+='#{?#{||:#{==:#{@ccb_agent_base},OpenCode},#{==:#{@ccb_agent},OpenCode}},#[fg='${bg_main}']#[bg='${color_purple}']#[bold] #P #{@ccb_agent} #[default],'
+pane_format+='#{?#{||:#{==:#{@ccb_agent_base},Droid},#{==:#{@ccb_agent},Droid}},#[fg='${bg_main}']#[bg='${color_yellow}']#[bold] #P #{@ccb_agent} #[default],'
+pane_format+='#{?#{||:#{==:#{@ccb_agent_base},Cmd},#{==:#{@ccb_agent},Cmd}},#[fg='${bg_main}']#[bg='${color_teal}']#[bold] #P #{@ccb_agent} #[default],'
 pane_format+='#[fg='${pane_default_fg}'] #P #{pane_title} #[default]}}}}}}'
 
 tmux set-window-option -t "$session" pane-border-format "$pane_format" >/dev/null 2>&1 || true

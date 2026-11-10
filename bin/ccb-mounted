@@ -105,6 +105,29 @@ else
         MOUNTED="$MOUNTED $provider"
       fi
     fi
+
+    # Also check instance-qualified session files (.ccb/.<provider>-<instance>-session)
+    for sf in "$CWD/.ccb/.${provider}-"*-session "$CWD/.ccb_config/.${provider}-"*-session; do
+      [[ -f "$sf" ]] || continue
+      fname="$(basename "$sf")"
+      inst="${fname#.${provider}-}"
+      inst="${inst%-session}"
+      [[ -n "$inst" ]] || continue
+      IS_ONLINE=false
+      if [[ "$UNIFIED_ONLINE" == true ]]; then
+        IS_ONLINE=true
+      elif echo "$ONLINE" | grep -q "${daemon}d"; then
+        IS_ONLINE=true
+      fi
+      if [[ "$IS_ONLINE" == false ]] && [[ "$AUTOSTART" == true ]]; then
+        if (cd "$CWD" && "$SCRIPT_DIR/ccb-ping" "${provider}:${inst}" --autostart) >/dev/null 2>&1; then
+          IS_ONLINE=true
+        fi
+      fi
+      if [[ "$IS_ONLINE" == true ]]; then
+        MOUNTED="$MOUNTED ${provider}:${inst}"
+      fi
+    done
   done
 fi
 

@@ -227,25 +227,110 @@ RASK_CLIENT_SPEC = ProviderClientSpec(
 
 # ── Multi-instance provider utilities ────────────────────────────────────────
 
+KNOWN_PROVIDERS = (
+    "codex",
+    "gemini",
+    "opencode",
+    "claude",
+    "droid",
+    "copilot",
+    "codebuddy",
+    "qwen",
+    "grok",
+)
+
+PROVIDER_DISPLAY_NAMES = {
+    "codex": "Codex",
+    "gemini": "Gemini",
+    "opencode": "OpenCode",
+    "claude": "Claude",
+    "droid": "Droid",
+    "copilot": "Copilot",
+    "codebuddy": "CodeBuddy",
+    "qwen": "Qwen",
+    "grok": "Grok",
+}
+
+SESSION_BASE_FILENAMES = {
+    "codex": ".codex-session",
+    "gemini": ".gemini-session",
+    "opencode": ".opencode-session",
+    "claude": ".claude-session",
+    "droid": ".droid-session",
+    "copilot": ".copilot-session",
+    "codebuddy": ".codebuddy-session",
+    "qwen": ".qwen-session",
+    "grok": ".grok-session",
+}
+
+
+def _canonical_base_provider(name: str) -> str:
+    low = (name or "").strip().lower()
+    if low in ("agy", "antigravity"):
+        return "gemini"
+    return low
+
 
 def parse_qualified_provider(key: str) -> tuple[str, str | None]:
     """Parse 'codex:auth' -> ('codex', 'auth'); 'codex' -> ('codex', None)."""
     key = (key or "").strip().lower()
     if not key:
         return ("", None)
+    # Support 'alias=provider' shorthand -> ('provider', 'alias')
+    if "=" in key and ":" not in key:
+        lhs, rhs = key.split("=", 1)
+        lhs = lhs.strip()
+        rhs = _canonical_base_provider(rhs)
+        if lhs and rhs in KNOWN_PROVIDERS:
+            return (rhs, lhs)
     # Only split on first colon to separate provider from instance
     parts = key.split(":", 1)
-    base = parts[0].strip()
+    base = _canonical_base_provider(parts[0])
     instance = parts[1].strip() if len(parts) > 1 and parts[1].strip() else None
     return (base, instance)
 
 
 def make_qualified_key(base: str, instance: str | None) -> str:
     """Combine base provider and instance: 'codex' + 'auth' -> 'codex:auth'."""
-    base = (base or "").strip().lower()
-    if instance:
-        return f"{base}:{instance.strip()}"
+    base = _canonical_base_provider(base)
+    if instance and instance.strip():
+        return f"{base}:{instance.strip().lower()}"
     return base
+
+
+def normalize_provider_token(raw: str, aliases: dict[str, str] | None = None) -> str:
+    """Normalize a provider token or alias into canonical 'base' or 'base:instance'.
+
+    Supports:
+    - 'opencode:oc1' -> 'opencode:oc1'
+    - 'oc1=opencode' -> 'opencode:oc1'
+    - 'agy:oc1'      -> 'gemini:oc1'
+    - 'oc1' with aliases={'oc1': 'opencode'} -> 'opencode:oc1'
+    """
+    token = (raw or "").strip().lower()
+    if not token or token == "cmd":
+        return token
+
+    if aliases and isinstance(aliases, dict):
+        mapped = aliases.get(token) or aliases.get(raw.strip())
+        if isinstance(mapped, str) and mapped.strip():
+            m_base, m_inst = parse_qualified_provider(mapped)
+            if m_base:
+                return make_qualified_key(m_base, m_inst or token)
+
+    base, instance = parse_qualified_provider(token)
+    if not base:
+        return ""
+    return make_qualified_key(base, instance)
+
+
+def display_provider_name(provider: str) -> str:
+    """Human-readable display name: 'opencode:oc1' -> 'OpenCode:oc1'."""
+    base, instance = parse_qualified_provider(provider)
+    base_display = PROVIDER_DISPLAY_NAMES.get(base, base.capitalize() if base else "")
+    if instance:
+        return f"{base_display}:{instance}"
+    return base_display
 
 
 def session_filename_for_instance(base_filename: str, instance: str | None) -> str:
@@ -265,3 +350,118 @@ def session_filename_for_instance(base_filename: str, instance: str | None) -> s
         return f"{prefix}-{instance}-session"
     # Fallback: append instance before extension
     return f"{base_filename}-{instance}"
+
+
+def session_filename_for_provider(provider: str) -> str:
+    """Return session filename for a plain or qualified provider key."""
+    base, instance = parse_qualified_provider(provider)
+    base_file = SESSION_BASE_FILENAMES.get(base, f".{base}-session")
+    return session_filename_for_instance(base_file, instance)
+
+
+def resolve_provider_key(
+    raw: str,
+    work_dir: object = None,
+    allowed_bases: set[str] | tuple[str, ...] | None = None,
+) -> tuple[str, str | None, str]:
+    """Resolve a provider or bare alias name into (base_provider, instance, qualified_key).
+
+    Allows addressing an instance either as 'opencode:oc1' or directly as 'oc1'
+    when 'oc1' is configured in ccb.config or has an active '.<base>-oc1-session' file.
+    """
+    import json
+    import os
+    from pathlib import Path
+
+    allowed = set(allowed_bases) if allowed_bases is not None else set(KNOWN_PROVIDERS)
+    norm = normalize_provider_token(raw)
+    base, instance = parse_qualified_provider(norm)
+    if base in allowed:
+        qualified = make_qualified_key(base, instance)
+        return base, instance, qualified
+
+    # Bare alias lookup (e.g. 'oc1' -> 'opencode:oc1')
+    alias = (raw or "").strip().lower()
+    if not alias or ":" in alias or "=" in alias:
+        return base, instance, make_qualified_key(base, instance)
+
+    roots: list[Path] = []
+    if work_dir:
+        try:
+            roots.append(Path(str(work_dir)).expanduser())
+        except Exception:
+            pass
+    env_wd = (os.environ.get("CCB_WORK_DIR") or "").strip()
+    if env_wd:
+        try:
+            p = Path(env_wd).expanduser()
+            if p not in roots:
+                roots.append(p)
+        except Exception:
+            pass
+    try:
+        cwd = Path.cwd()
+        if cwd not in roots:
+            roots.append(cwd)
+    except Exception:
+        pass
+
+    # 1. Check active session files in work_dir (.ccb/.<prov>-<alias>-session)
+    for root in roots:
+        for cfg_dir in (root / ".ccb", root / ".ccb_config", root):
+            if not cfg_dir.is_dir():
+                continue
+            for cand_base in KNOWN_PROVIDERS:
+                if cand_base not in allowed:
+                    continue
+                base_fn = SESSION_BASE_FILENAMES.get(cand_base, f".{cand_base}-session")
+                cand_fn = session_filename_for_instance(base_fn, alias)
+                if (cfg_dir / cand_fn).is_file():
+                    return cand_base, alias, make_qualified_key(cand_base, alias)
+
+    # 2. Check ccb.config (aliases map or providers list with '<base>:<alias>')
+    cfg_paths: list[Path] = []
+    for root in roots:
+        cfg_paths.append(root / ".ccb" / "ccb.config")
+        cfg_paths.append(root / ".ccb_config" / "ccb.config")
+    try:
+        cfg_paths.append(Path.home() / ".ccb" / "ccb.config")
+    except Exception:
+        pass
+
+    for cfg_path in cfg_paths:
+        if not cfg_path.is_file():
+            continue
+        try:
+            raw_text = cfg_path.read_text(encoding="utf-8-sig").strip()
+        except Exception:
+            continue
+        if not raw_text:
+            continue
+        try:
+            obj = json.loads(raw_text)
+        except Exception:
+            obj = None
+        if isinstance(obj, dict):
+            aliases_map = obj.get("aliases")
+            if isinstance(aliases_map, dict):
+                mapped = aliases_map.get(alias)
+                if isinstance(mapped, str) and mapped.strip():
+                    m_base, m_inst = parse_qualified_provider(mapped)
+                    if m_base in allowed:
+                        inst = m_inst or alias
+                        return m_base, inst, make_qualified_key(m_base, inst)
+            raw_provs = obj.get("providers")
+            tokens = raw_provs if isinstance(raw_provs, list) else ([raw_provs] if isinstance(raw_provs, str) else [])
+        elif isinstance(obj, list):
+            tokens = obj
+        else:
+            tokens = [raw_text]
+
+        for item in tokens:
+            for part in str(item or "").replace(",", " ").split():
+                p_base, p_inst = parse_qualified_provider(part)
+                if p_base in allowed and p_inst == alias:
+                    return p_base, p_inst, make_qualified_key(p_base, p_inst)
+
+    return base, instance, make_qualified_key(base, instance)

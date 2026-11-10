@@ -18,6 +18,11 @@ import subprocess
 from pathlib import Path
 
 script_dir = Path(__file__).resolve().parent
+lib_dir = script_dir.parent / "lib"
+sys.path.insert(0, str(lib_dir))
+
+from providers import resolve_provider_key, session_filename_for_provider
+from session_utils import find_project_session_file
 
 
 # Provider to original pend command mapping
@@ -34,7 +39,7 @@ def _usage():
     print("Usage: pend <provider> [N] [--session-file FILE]", file=sys.stderr)
     print("", file=sys.stderr)
     print("Providers:", file=sys.stderr)
-    print("  gemini, codex, opencode, droid, claude", file=sys.stderr)
+    print("  gemini, codex, opencode, droid, claude (or <provider>:<alias> / <alias>)", file=sys.stderr)
     print("", file=sys.stderr)
     print("Arguments:", file=sys.stderr)
     print("  N    Show the latest N conversations (default: 1)", file=sys.stderr)
@@ -45,34 +50,47 @@ def main():
         _usage()
         return 1
 
-    provider = sys.argv[1].lower()
+    raw_provider = sys.argv[1].lower()
 
-    if provider in ("-h", "--help"):
+    if raw_provider in ("-h", "--help"):
         _usage()
         return 0
 
-    if provider not in PROVIDER_PENDS:
-        print(f"[ERROR] Unknown provider: {provider}", file=sys.stderr)
+    base_provider, instance, qualified = resolve_provider_key(
+        raw_provider, allowed_bases=set(PROVIDER_PENDS.keys())
+    )
+
+    if base_provider not in PROVIDER_PENDS:
+        print(f"[ERROR] Unknown provider: {raw_provider}", file=sys.stderr)
         print(f"[ERROR] Available: {', '.join(PROVIDER_PENDS.keys())}", file=sys.stderr)
         return 1
 
     # Get the original pend command
-    pend_cmd = PROVIDER_PENDS[provider]
+    pend_cmd = PROVIDER_PENDS[base_provider]
     pend_path = script_dir / pend_cmd
 
     if not pend_path.exists():
         print(f"[ERROR] Command not found: {pend_path}", file=sys.stderr)
         return 1
 
+    extra_args = list(sys.argv[2:])
+    env = os.environ.copy()
+    if instance and "--session-file" not in extra_args:
+        sf = find_project_session_file(Path.cwd(), session_filename_for_provider(qualified))
+        if sf:
+            env["CCB_SESSION_FILE"] = str(sf)
+            if base_provider in ("opencode", "gemini", "codex", "droid", "claude"):
+                extra_args.extend(["--session-file", str(sf)])
+
     # Pass remaining arguments to the original command
     # On Windows, need to use Python interpreter explicitly
     if sys.platform == "win32":
-        cmd = [sys.executable, str(pend_path)] + sys.argv[2:]
+        cmd = [sys.executable, str(pend_path)] + extra_args
     else:
-        cmd = [str(pend_path)] + sys.argv[2:]
+        cmd = [str(pend_path)] + extra_args
 
     try:
-        result = subprocess.run(cmd)
+        result = subprocess.run(cmd, env=env)
         return result.returncode
     except Exception as e:
         print(f"[ERROR] {e}", file=sys.stderr)

@@ -19,6 +19,8 @@ lib_dir = script_dir.parent / "lib"
 sys.path.insert(0, str(lib_dir))
 
 from compat import setup_windows_encoding
+from providers import resolve_provider_key, session_filename_for_provider
+from session_utils import find_project_session_file
 setup_windows_encoding()
 
 
@@ -60,26 +62,36 @@ def main():
         _usage()
         return 1
 
-    provider = sys.argv[1].lower()
+    raw_provider = sys.argv[1].lower()
 
-    if provider in ("-h", "--help"):
+    if raw_provider in ("-h", "--help"):
         _usage()
         return 0
 
-    if provider not in PROVIDER_COMMS:
-        print(f"[ERROR] Unknown provider: {provider}", file=sys.stderr)
+    base_provider, instance, qualified = resolve_provider_key(
+        raw_provider, allowed_bases=set(PROVIDER_COMMS.keys())
+    )
+
+    if base_provider not in PROVIDER_COMMS:
+        print(f"[ERROR] Unknown provider: {raw_provider}", file=sys.stderr)
         print(f"[ERROR] Available: {', '.join(PROVIDER_COMMS.keys())}", file=sys.stderr)
         return 1
 
+    provider = base_provider
+
     # Parse remaining arguments
-    parser = argparse.ArgumentParser(prog=f"ccb-ping {provider}", add_help=False)
+    parser = argparse.ArgumentParser(prog=f"ccb-ping {qualified}", add_help=False)
     parser.add_argument("--session-file", dest="session_file", default=None)
     parser.add_argument("--autostart", action="store_true", help="Start daemon if needed")
     args, _ = parser.parse_known_args(sys.argv[2:])
 
+    work_dir = _resolve_work_dir(args.session_file)
     if args.session_file:
         os.environ["CCB_SESSION_FILE"] = str(args.session_file)
-    work_dir = _resolve_work_dir(args.session_file)
+    elif instance:
+        sf = find_project_session_file(work_dir, session_filename_for_provider(qualified))
+        if sf:
+            os.environ["CCB_SESSION_FILE"] = str(sf)
 
     # Import and instantiate the communicator
     module_name, class_name = PROVIDER_COMMS[provider]
